@@ -165,3 +165,47 @@ def test_role_zero_sequence_voltage_aliases():
     """部分厂家用 Vo 表示零序电压。"""
     for name in ("Vo", "V0", "Uo", "UN"):
         assert identify(name, "", "voltage").role is ChannelRole.U0, name
+
+
+def test_duplicate_roles_are_reported():
+    """多个通道占用同一角色时必须告警。
+
+    真实样例（SEL-651R 趋势记录）里同时存在 IARMS / SDIA / SDIAREF / dA
+    四组 A/B/C 电流，ph 与 uu 字段完全一样，角色识别只能都标成 IA/IB/IC。
+    这不是识别错误，但下游按角色取通道会有歧义，必须让人知道。
+    """
+    from comtrade.channels import identify_all
+    from comtrade.diagnostics import Code, DiagnosticCollector
+
+    channels = [
+        _mk("IARMS", "A"), _mk("IBRMS", "B"), _mk("ICRMS", "C"),
+        _mk("SDIA", "A"), _mk("SDIB", "B"), _mk("SDIC", "C"),
+    ]
+    diag = DiagnosticCollector()
+    identify_all(channels, diag, location="t.cfg")
+
+    hits = [d for d in diag if d.code == Code.CHN_ROLE_DUPLICATE]
+    assert hits, "应当报告角色重复"
+    assert "IA 有 2 个" in hits[0].message
+    assert "SDIA" in hits[0].message
+
+
+def test_single_role_per_phase_is_silent():
+    """每个角色只被一个通道占用时不应报警。"""
+    from comtrade.channels import identify_all
+    from comtrade.diagnostics import Code, DiagnosticCollector
+
+    channels = [_mk(n, p) for n, p in (("Ia", "A"), ("Ib", "B"), ("Ic", "C"))]
+    diag = DiagnosticCollector()
+    identify_all(channels, diag, location="t.cfg")
+    assert Code.CHN_ROLE_DUPLICATE not in diag.codes()
+
+
+def _mk(name: str, phase: str):
+    from comtrade.models import AnalogChannel
+
+    return AnalogChannel(
+        index=0, declared_no=1, name=name, phase_raw=phase, circuit="",
+        unit_raw="A", a=1.0, b=0.0, skew_us=0.0, raw_min=-32767.0, raw_max=32767.0,
+        primary=1000.0, secondary=1.0, ps="P",
+    )
