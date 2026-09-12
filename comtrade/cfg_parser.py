@@ -421,7 +421,8 @@ def _parse_header(
 
     diagnostics.warn(
         Code.CFG_VERSION_NONSTANDARD,
-        f"版本年份 {year} 早于 1991，按 1991 版规则解析",
+        f"版本年份 {year} 不是标准年份（1991/1999/2013），按 {ComtradeVersion.V1991.label} "
+        "版字段规则解析；实际字段数以通道行本身为准（10 或 13 字段均可）",
         location=cursor.location(line_no),
     )
     return ComtradeVersion.V1991, year
@@ -675,6 +676,31 @@ def _parse_sample_rates(
         nrates = 0
 
     if nrates == 0:
+        # 现场变体：声明 0 组，但**下一行仍然是"采样率,结束采样号"**。
+        # 典型样本：SEL 装置的 `0,20700`、Wisp 的 `0,  1360` ——
+        # 采样率填 0（表示未知，需按 dat 时标推导），但结束采样号是真实的，
+        # 可用于校验记录总数。
+        # 这一行**必须消费掉**，否则其后所有行整体错位一行，
+        # 表现为"起始时间无法解析"→"数据格式无法识别"→ 致命错误。
+        peeked = cursor.peek_next()
+        if peeked is not None:
+            fields = _split(peeked[1])
+            rate = _as_float(fields[0]) if len(fields) >= 1 else None
+            end_sample = _as_int(fields[1]) if len(fields) >= 2 else None
+            if len(fields) == 2 and rate is not None and end_sample is not None:
+                cursor.next("采样率行（声明段数为 0 的现场变体）")
+                diagnostics.warn(
+                    Code.CFG_NO_SAMPLE_RATE,
+                    f"采样率段数声明为 0，但随后给出了采样率行「{peeked[1].strip()}」；"
+                    "已按该行读取（采样率为 0 表示未声明，时间轴改用采样点自带时标推算，"
+                    "结束采样号仍用于校验记录总数）",
+                    location=cursor.location(peeked[0]),
+                )
+                if rate <= 0:
+                    # 速率未知：保留段记录以携带结束采样号，时间轴生成会自动跳过它
+                    return [SampleRateSegment(rate_hz=0.0, end_sample=end_sample)], end_sample
+                return [SampleRateSegment(rate_hz=rate, end_sample=end_sample)], end_sample
+
         diagnostics.warn(
             Code.CFG_NO_SAMPLE_RATE,
             "文件声明的采样率段数为 0，时间轴将改用采样点自带时标推算",

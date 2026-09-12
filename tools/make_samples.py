@@ -215,17 +215,47 @@ class SampleSpec:
     line_freq: float = F_LINE
     multirate: bool = False
     inject_missing: bool = False
-    ascii_pre_scaled: bool = False
     chinese_names: bool = False
     encoding: str = "utf-8"
     fault_time: float = 0.1
     duration: float = 0.4
     sample_rate: float = 4000.0
     jitter: float = 0.0
+    raw_full_scale: float | None = None
+    """原始计数实际占用的满量程（None 表示占满 ±32767）。
+
+    真实现场常见「cfg 声明 ±32767、实际计数只用了几百」的情况（SEL 装置即如此）。
+    这个参数用于复现该现象，验证解析器不会据此误判为"已是工程量"。
+    """
     notes: str = ""
 
 
+def _rescale(specs: tuple[ChannelSpec, ...], raw_full_scale: float) -> tuple[ChannelSpec, ...]:
+    """按「实际占用的满量程」重算 a。
+
+    cfg 声明 ±32767，但装置实际只用了其中一小段，于是 a 必须相应放大，
+    才能把原始计数换算回正确的二次值。
+    """
+    out = []
+    for ch in specs:
+        secondary_fs = I_SECONDARY_FS if ch.quantity == "I" else U_SECONDARY_FS
+        out.append(
+            ChannelSpec(
+                ch.name, ch.phase, ch.unit, secondary_fs / raw_full_scale, ch.b,
+                ch.primary, ch.secondary, ch.ps, ch.quantity, ch.ratio, ch.scale_pu,
+            )
+        )
+    return tuple(out)
+
+
 def _analog_specs_for(spec: SampleSpec) -> tuple[ChannelSpec, ...]:
+    specs = _build_analog_specs(spec)
+    if spec.raw_full_scale:
+        specs = _rescale(specs, spec.raw_full_scale)
+    return specs
+
+
+def _build_analog_specs(spec: SampleSpec) -> tuple[ChannelSpec, ...]:
     if not spec.chinese_names:
         return ANALOG_SPECS
     replacements = {
@@ -320,12 +350,19 @@ def _write_cfg(
 
     # 模拟通道
     for i, ch in enumerate(analog_specs, start=1):
-        # 1991 版没有 primary/secondary/PS 字段，录波器只能把变比直接烘焙进 a/b，
-        # 否则解析出来的就只是二次值。这里按真实现场做法生成。
-        a_effective = ch.a * ch.ratio if spec.version == 1991 else ch.a
+        if spec.data_type == "FLOAT32":
+            # FLOAT32 通常直接存工程量，cfg 的 a/b 按惯例置为单位映射。
+            # 若此处仍写原始计数换算系数，解析器会被误导（真实文件不会这样写）。
+            a_effective, b_effective = 1.0, 0.0
+        elif spec.version == 1991:
+            # 1991 版没有 primary/secondary/PS 字段，录波器只能把变比直接烘焙进 a/b，
+            # 否则解析出来的就只是二次值。这里按真实现场做法生成。
+            a_effective, b_effective = ch.a * ch.ratio, ch.b
+        else:
+            a_effective, b_effective = ch.a, ch.b
         base = (
             f"{i},{ch.name},{ch.phase},LINE1,{ch.unit},"
-            f"{a_effective:.10g},{ch.b:.10g},0,-32767,32767"
+            f"{a_effective:.10g},{b_effective:.10g},0,-32767,32767"
         )
         if spec.version >= 1999:
             base += f",{ch.primary:.10g},{ch.secondary:.10g},{ch.ps}"
@@ -426,12 +463,8 @@ def _write_ascii(
     for s in range(n):
         cols: list[str] = [str(sample_numbers[s]), str(timestamps[s])]
         for i, ch in enumerate(analog_specs):
-            value = raw[i, s]
-            if spec.ascii_pre_scaled:
-                # 已经换算成工程量的 ASCII：直接写二次值
-                cols.append(f"{value * ch.a + ch.b:.6f}")
-            else:
-                cols.append(str(int(value)))
+            # 标准要求 ASCII 存原始计数，换算由解析器按 cfg 的 a/b 完成
+            cols.append(str(int(raw[i, s])))
         cols.extend("1" if wave.digital[d, s] else "0" for d in range(len(DIGITAL_SPECS)))
         out.append(",".join(cols))
     path.write_text("\n".join(out) + "\n", encoding="ascii", newline="\n")
@@ -491,11 +524,12 @@ def default_samples() -> list[SampleSpec]:
             notes="中文通道名 + GBK 编码，验证编码兜底与中文名称的通道识别",
         ),
         SampleSpec(
-            name="v1999_ascii_prescaled",
+            name="v1999_ascii_smallspan",
             version=1999,
             data_type="ASCII",
-            ascii_pre_scaled=True,
-            notes="ASCII 但内容已是工程量，验证 a/b 换算的自动判定（不应二次换算）",
+            raw_full_scale=100.0,
+            notes="ASCII 原始计数只用到 ±100（cfg 却声明 ±32767），复现 SEL 等装置的现场情形；"
+                  "验证仍按标准施加 a/b 换算，只给出 DAT-009 提示而不跳过换算",
         ),
         SampleSpec(
             name="v1999_noisy",

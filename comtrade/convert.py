@@ -16,12 +16,17 @@
     **换算在解析层只做一次。** 如果留给波形、算法模块各自做，
     同一个系数会散落在多个模块里，出错时无法定位是谁算错的。
 
-关于 ASCII / FLOAT32 是否已换算的二义性
-    标准与主流实现（python-comtrade / comtrade-rs / GSF / pycomtrade）
-    都把 ASCII 的模拟量当作原始值，同样施加 a/b 换算。
-    但现场确实存在直接写工程量的 ASCII 文件，盲目换算会得到静默错误的结果。
-    本模块按 :class:`~comtrade.options.AsciiScaling` 策略处理，默认 AUTO：
-    用数据跨度与 cfg 声明的量程跨度比对来自动判定。
+关于 ASCII 是否已换算的二义性
+    标准与全部主流实现（python-comtrade / comtrade-rs / GSF / pycomtrade）
+    都对 ASCII 的模拟量施加 a/b 换算。现场确实也存在直接写工程量的 ASCII 文件，
+    但**两者无法可靠区分** —— 真实文件里"min/max 声明满量程、实际原始计数很小"
+    是正常现象（SEL 等装置的 ASCII 样例即如此）。
+
+    本模块早期版本曾用"数据跨度 vs 声明量程跨度"自动判定并跳过换算，
+    在 11 组真实公开样例（186 个通道）上实测误判 10 个通道、且全部错向"跳过"。
+    因此现在：**默认按标准换算**，跨度判定降级为纯提示（DAT-009），
+    需要跳过的场景由使用者显式设置 ``ascii_scaling="never"``。
+
     **判定结果按文件聚合后一次性报告** —— 一个根因只出一条诊断，
     避免 7 个通道刷 7 条同样的警告把界面淹掉。
 """
@@ -45,12 +50,9 @@ MIN_MISSING_ABSOLUTE = 8
 
 #: 判定依据标签
 _R_A_ZERO = "a_zero"
-_R_BINARY = "binary"
+_R_SCALED = "scaled"
 _R_IDENTITY = "identity"
-_R_ALWAYS = "always"
 _R_NEVER = "never"
-_R_PRESCALED = "prescaled"
-_R_FLOAT32 = "float32"
 
 
 def missing_sentinel(data_type: DataFileType, version: ComtradeVersion) -> float | None:
@@ -95,7 +97,7 @@ def convert_analog_channels(
     # 按文件聚合的判定结果：一个根因只报一条诊断
     prescaled: list[str] = []
     scale_skipped: list[str] = []
-    float32_untouched: list[str] = []
+    float32_nonidentity: list[str] = []
     missing_hits: list[tuple[str, int]] = []
     out_of_range: list[tuple[str, int]] = []
 
@@ -141,13 +143,20 @@ def convert_analog_channels(
                     invalid |= oor
 
         # ------------------------------------------------------ 3. a/b 换算
-        apply_scale, reason = _decide_scaling(ch, raw, data_type, options)
-        if reason == _R_PRESCALED:
-            prescaled.append(ch.name)
-        elif reason == _R_FLOAT32:
-            float32_untouched.append(ch.name)
-        elif reason == _R_A_ZERO:
+        apply_scale, reason = _decide_scaling(ch, options)
+        if reason == _R_A_ZERO:
             scale_skipped.append(ch.name)
+        elif reason == _R_NEVER:
+            prescaled.append(ch.name)
+        # 提示：只在"确实施加了换算"的前提下，提示"若文件其实已换算则应改用 never"
+        if apply_scale and _prescaled_suspicion(ch, raw, data_type, options):
+            prescaled.append(ch.name)
+        if (
+            data_type is DataFileType.FLOAT32
+            and apply_scale
+            and reason == _R_SCALED
+        ):
+            float32_nonidentity.append(ch.name)
 
         if apply_scale:
             values = raw * ch.a + ch.b
@@ -174,7 +183,7 @@ def convert_analog_channels(
 
     # ------------------------------------------------------------ 汇总诊断
     _report(diagnostics, location, missing_hits, out_of_range,
-            prescaled, scale_skipped, float32_untouched)
+            prescaled, scale_skipped, float32_nonidentity)
 
 
 def _report(
@@ -184,7 +193,7 @@ def _report(
     out_of_range: list[tuple[str, int]],
     prescaled: list[str],
     scale_skipped: list[str],
-    float32_untouched: list[str],
+    float32_nonidentity: list[str],
 ) -> None:
     """把逐通道的判定结果聚合成按文件维度的诊断。"""
     if missing_hits:
@@ -211,19 +220,20 @@ def _report(
     if prescaled:
         diagnostics.warn(
             Code.DAT_ASCII_PRESCALED,
-            f"有 {len(prescaled)} 个通道的数据跨度远小于 cfg 声明的量程跨度，"
-            "判定数据已经是工程量、已跳过 a/b 换算："
+            f"有 {len(prescaled)} 个通道的数据跨度远小于 cfg 声明的量程跨度："
             + "、".join(prescaled[:8])
             + ("…" if len(prescaled) > 8 else "")
-            + "。若判定有误，请将 ascii_scaling 设为 always",
+            + "。已按标准施加 a/b 换算；"
+            "若这些通道存的确实已经是工程量，请将 ascii_scaling 设为 never",
             location=location,
         )
 
-    if float32_untouched:
+    if float32_nonidentity:
         diagnostics.info(
             Code.DAT_FLOAT32_SCALED,
-            f"FLOAT32 编码的 {len(float32_untouched)} 个通道按工程量直接读取（未施加 a/b 换算），"
-            "这是该编码的常规做法",
+            f"FLOAT32 编码的 {len(float32_nonidentity)} 个通道带有非单位比例系数并已施加换算："
+            + "、".join(float32_nonidentity[:8])
+            + "。FLOAT32 通常直接存工程量（a=1, b=0），若数值异常请核对 cfg",
             location=location,
         )
 
@@ -239,43 +249,48 @@ def _report(
 
 def _decide_scaling(
     ch: AnalogChannel,
+    options: ParseOptions,
+) -> tuple[bool, str | None]:
+    """判定是否对某通道施加 a/b 换算。
+
+    **只做两件事：a 为 0 时跳过（无法换算），以及 NEVER 策略下跳过。**
+    其余情况一律按标准施加换算 —— 真实文件里"原始计数很小"是正常现象，
+    不能据此判定数据已经是工程量（11 组真实样例实测该判定 100% 误判）。
+    """
+    if ch.a == 0.0:
+        return False, _R_A_ZERO
+    if options.ascii_scaling is AsciiScaling.NEVER:
+        return False, _R_NEVER
+    if ch.a == 1.0 and ch.b == 0.0:
+        return True, _R_IDENTITY
+    return True, _R_SCALED
+
+
+def _prescaled_suspicion(
+    ch: AnalogChannel,
     raw: np.ndarray,
     data_type: DataFileType,
     options: ParseOptions,
-) -> tuple[bool, str | None]:
-    """判定是否对某通道施加 a/b 换算，并给出判定依据。"""
-    if ch.a == 0.0:
-        return False, _R_A_ZERO
+) -> bool:
+    """数据跨度远小于声明量程跨度 —— 仅为提示，不改变解析行为。
 
-    # 恒等映射：走哪条路径结果都一样，不必判定
-    if abs(ch.a - 1.0) < 1e-15 and abs(ch.b) < 1e-15:
-        return True, _R_IDENTITY
-
-    # 二进制整型必然是 ADC 原始计数，一定要换算
-    if data_type in (DataFileType.BINARY, DataFileType.BINARY32):
-        return True, _R_BINARY
-
-    if options.ascii_scaling is AsciiScaling.ALWAYS:
-        return True, _R_ALWAYS
-    if options.ascii_scaling is AsciiScaling.NEVER:
-        return False, _R_PRESCALED
-
+    只对 ASCII 判定：FLOAT32 的数值本来就是工程量，跨度小属正常，
+    由 DAT-011 单独提示。
+    """
+    if data_type is not DataFileType.ASCII:
+        return False
+    if ch.a in (0.0, 1.0):
+        return False
+    raw_span = ch.raw_max - ch.raw_min
+    if raw_span <= 0:
+        return False
     finite = raw[np.isfinite(raw)]
     if finite.size == 0:
-        return True, None
-
+        return False
     data_span = float(finite.max() - finite.min())
-    raw_span = ch.raw_max - ch.raw_min
-    if raw_span > 0 and data_span > 0:
-        if data_span / raw_span < options.prescaled_span_ratio:
-            # ASCII 里出现这种情况是异常、需要提醒；
-            # FLOAT32 里这是常规做法，仅作提示
-            reason = (
-                _R_FLOAT32 if data_type is DataFileType.FLOAT32 else _R_PRESCALED
-            )
-            return False, reason
-
-    return True, None
+    if data_span <= 0:
+        return False
+    return (data_span / raw_span) < options.prescaled_span_ratio
 
 
 def _apply_ratio(

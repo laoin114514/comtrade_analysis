@@ -36,6 +36,7 @@ def build_time_axis(
     *,
     location: str = "",
     rate_tolerance: float = 0.05,
+    source: str = "rates",
 ) -> np.ndarray:
     """生成时间轴（秒）。
 
@@ -46,6 +47,7 @@ def build_time_axis(
         diagnostics: 诊断收集器。
         location: 诊断定位信息。
         rate_tolerance: 两种机制的一致性容差（相对值）。
+        source: 优先依据，``"rates"``（采样率分段优先）或 ``"timestamps"``。
 
     Returns:
         形状 ``(N,)`` 的 ``float64`` 时间轴。
@@ -68,14 +70,15 @@ def build_time_axis(
         return np.arange(count, dtype=np.float64)
 
     if rate_axis is None:
-        axis = time_axis_from_ts
-        origin = "采样时标"
+        axis, origin = time_axis_from_ts, "采样时标"
     elif time_axis_from_ts is None:
-        axis = rate_axis
-        origin = "采样率分段"
+        axis, origin = rate_axis, "采样率分段"
+    elif source == "timestamps":
+        # 时标优先：反映录波器实际采样时刻，与标称采样率存在微小漂移
+        axis, origin = time_axis_from_ts, "采样时标（配置指定优先）"
+        _cross_check(time_axis_from_ts, rate_axis, rate_tolerance, diagnostics, location)
     else:
-        axis = rate_axis
-        origin = "采样率分段"
+        axis, origin = rate_axis, "采样率分段"
         _cross_check(rate_axis, time_axis_from_ts, rate_tolerance, diagnostics, location)
 
     _check_monotonic(axis, diagnostics, location)

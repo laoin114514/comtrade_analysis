@@ -34,9 +34,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ascii-scaling",
-        choices=["auto", "always", "never"],
-        default="auto",
-        help="ASCII 数据的 a/b 换算策略（默认 auto）",
+        choices=["always", "never"],
+        default="always",
+        help="ASCII 数据的 a/b 换算策略（默认 always，按标准施加 a/b 换算）",
     )
     return parser
 

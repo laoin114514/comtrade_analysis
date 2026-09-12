@@ -55,8 +55,9 @@ def normalize_name(name: str) -> str:
 #: 零序 / 中性点电压
 _ZERO_VOLTAGE_RES = (
     re.compile(r"^(?:3)?u0+[a-z0-9]*$"),  # u0 / 3u0 / u00 / 3U0A
-    re.compile(r"^uo\d*$"),
+    re.compile(r"^(?:u|v)o+\d*$"),  # uo / vo（部分厂家用 Vo 表示零序电压）
     re.compile(r"^un\d*$"),
+    re.compile(r"^v_?0\d*$"),
     re.compile(r"零序.*(?:电压|压|u)"),
     re.compile(r"中性(?:点)?电压"),
     re.compile(r"开口三角"),
@@ -65,7 +66,7 @@ _ZERO_VOLTAGE_RES = (
 #: 零序 / 中性线电流
 _ZERO_CURRENT_RES = (
     re.compile(r"^(?:3)?i0+[a-z0-9]*$"),  # i0 / 3i0 / i00 / 3I0A
-    re.compile(r"^io\d*$"),
+    re.compile(r"^io+\d*$"),
     re.compile(r"^in\d*$"),
     re.compile(r"零序"),  # 兜底：出现"零序"但不是电压的，按电流处理
     re.compile(r"中性(?:点|线)?电流"),
@@ -81,17 +82,17 @@ _LINE_VOLTAGE_RES: tuple[tuple[re.Pattern[str], ChannelRole], ...] = (
     (re.compile(r"^ca线电压"), ChannelRole.UCA),
 )
 
-#: 相电压
-_PHASE_VOLTAGE_RES = re.compile(
-    r"^(?:u|v|pt)([abc])(?:n|l|g|ph|e)?\d*$"  # ua / uan / va / ual / ua1 / pta
-)
+#: 相电压。
+#: 后缀放宽为任意字母数字，但**紧跟相别之后的字符不能再是相别字母** ——
+#: 这样 ``IAX``/``IBY``/``IAT``（不同绕组/支路的 A/B/C 相）能识别，
+#: 而 ``IAB``/``IBC``（相间量，相别含义不确定）不会被误判成单相量。
+#: ``(kV)`` 这类单位后缀在归一化时已被去掉，因此 ``VA(kV)`` → ``vakv`` 也能命中。
+_PHASE_VOLTAGE_RES = re.compile(r"^(?:u|v|pt)([abc])(?![abc])[a-z0-9]*$")
 #: IEC 习惯：UL1/UL2/UL3 对应 A/B/C
 _VOLTAGE_IEC_L123 = re.compile(r"^(?:u|v)l([123])\d*$")
 
-#: 相电流
-_PHASE_CURRENT_RES = re.compile(
-    r"^(?:i|ct|il)([abc])(?:n|l|g|ph|e)?\d*$"  # ia / ian / ia1 / cta
-)
+#: 相电流，后缀规则同相电压
+_PHASE_CURRENT_RES = re.compile(r"^(?:i|ct|il)([abc])(?![abc])[a-z0-9]*$")
 #: IEC 习惯：IL1/IL2/IL3 对应 A/B/C
 _CURRENT_IEC_L123 = re.compile(r"^il([123])\d*$")
 

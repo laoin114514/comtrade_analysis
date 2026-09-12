@@ -13,19 +13,21 @@ from dataclasses import dataclass
 class AsciiScaling(str, enum.Enum):
     """ASCII 模拟量的换算策略。
 
-    背景：主流实现（以及标准的一般解读）是 ASCII 的模拟量同样是"原始值"，
-    需要 ``a * raw + b`` 换算。但现场确实存在直接写工程量的 ASCII 文件，
-    盲目换算会得到静默错误的结果（差几百倍且不报错）。
+    背景：标准与全部主流实现（python-comtrade / comtrade-rs / GSF / pycomtrade）
+    都对 ASCII 的模拟量施加 ``a * raw + b`` 换算。现场确实存在直接写工程量的
+    ASCII 文件，但也有大量"min/max 声明满量程、实际原始计数很小"的正常文件，
+    两者无法可靠区分。
+
+    早期版本默认用"数据跨度 vs 声明量程跨度"自动判定并跳过换算，
+    在 11 组真实公开样例（186 个通道）上实测误判 10 个通道、全部错向"跳过"，
+    因此**默认改为按标准换算**，跨度判定降级为纯提示（见 ``prescaled_span_ratio``）。
     """
 
-    AUTO = "auto"
-    """按数据范围自动判定（默认）。"""
-
     ALWAYS = "always"
-    """始终应用 a/b 换算。"""
+    """按标准施加 a/b 换算（默认）。"""
 
     NEVER = "never"
-    """从不应用 a/b 换算（确认客户文件写的是工程量时使用）。"""
+    """不施加 a/b 换算。仅在确认客户文件写的是工程量时使用。"""
 
 
 @dataclass(slots=True)
@@ -44,14 +46,18 @@ class ParseOptions:
     """
 
     # -------------------------------------------------------------- 换算策略
-    ascii_scaling: AsciiScaling = AsciiScaling.AUTO
+    ascii_scaling: AsciiScaling = AsciiScaling.ALWAYS
     """ASCII 数据的 a/b 换算策略，见 :class:`AsciiScaling`。"""
 
     prescaled_span_ratio: float = 0.05
-    """自动判定的阈值：数据跨度小于 min/max 跨度该比例时，判定为"已换算"。
+    """跨度提示的阈值（**纯提示，不改变解析行为**）。
 
-    真实 ADC 原始数据（正弦波）几乎占满 min/max 声明的量程，
-    因此数据跨度远小于声明的量程跨度，即说明它已经是工程量。
+    ASCII 通道的数据跨度小于 min/max 声明跨度该比例时，记录一条 DAT-009 提示：
+    "这个通道看起来可能已经是工程量了，若确认如此请把 ascii_scaling 设为 never"。
+
+    注意：真实文件中"min/max 声明满量程、实际原始计数很小"是**正常现象**
+    （SEL 等装置的 ASCII 样例即如此），因此该判定只作为提示，
+    不再像早期版本那样据此跳过换算。
     """
 
     apply_ratio_conversion: bool = True
@@ -78,6 +84,22 @@ class ParseOptions:
 
     rate_tolerance: float = 0.05
     """采样率推算时间与采样时标推算时间的相对容差，超出则记录 TIM-002。"""
+
+    time_axis_source: str = "rates"
+    """时间轴的优先依据。
+
+    ``"rates"``（默认）
+        采样率分段优先，采样时标兜底。标准定义的方式，
+        也是 GSF / comtrade-rs / python-comtrade 的一致做法。
+
+    ``"timestamps"``
+        采样时标优先，采样率分段兜底。反映录波器**实际**的采样时刻，
+        单频文件里与本机标称采样率会有微小漂移（实测样例差 0.04%~0.1%）。
+
+    两者都会做交叉校验与单调性检查。同一份文件两种取值可能给出
+    略有差异的时间轴，**用客户真实文件确定后应固定下来**，
+    否则同一份录波在两处（如本模块与已有解析服务）会算出不同的时长。
+    """
 
     # ---------------------------------------------------------------- 严格度
     strict_channel_count: bool = False

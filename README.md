@@ -228,7 +228,8 @@ rec.unresolved_channels()                 # 需要人工映射的通道
 from comtrade import ParseOptions, AsciiScaling
 
 opts = ParseOptions(
-    ascii_scaling=AsciiScaling.AUTO,   # ASCII 的 a/b 换算策略：auto / always / never
+    ascii_scaling=AsciiScaling.ALWAYS, # ASCII 的 a/b 换算策略：always（默认）/ never
+    time_axis_source="rates",          # 时间轴优先依据：rates（默认）/ timestamps
     apply_ratio_conversion=True,       # 是否按 PS 把数值换算到一次值
     mask_missing_values=True,          # 是否把缺失值哨兵标为 NaN
     mask_out_of_range=False,           # 是否按 min/max 剔除越界点（默认关，见下）
@@ -239,6 +240,8 @@ rec = load_recording(path, opts)
 ```
 
 `mask_out_of_range` 默认关闭是有意的：`min/max` 是文件里的元数据，现场常常写错，按它删数据是破坏性的。默认只报诊断、不删数据。
+
+`time_axis_source` 是项目内两套解析实现的分歧点（另一套是采样时标优先）。单频文件里两种依据会差 0.04%~0.1% —— 采样率是装置声明的「契约值」，采样时标反映「实际时钟漂移」。**用客户真实文件确定后应固定下来**，否则同一份录波在两处会算出不同的时长。
 
 ---
 
@@ -273,13 +276,21 @@ rec = load_recording(path, opts)
 
 ### 2. ASCII 数据的 a/b 换算
 
-标准与主流实现（python-comtrade / comtrade-rs / GSF / pycomtrade）都把 ASCII 的模拟量当原始值，同样施加 `a×raw+b`。但现场确实存在直接写工程量的 ASCII 文件，盲目换算会得到**静默错误**（差几百倍且不报错）。
+标准与全部主流实现都对 ASCII 的模拟量施加 `a×raw+b` 换算，本模块默认遵循。
+现场确实也存在直接写工程量的 ASCII 文件，但**两者无法可靠区分** ——
+真实文件里「min/max 声明满量程、实际原始计数很小」是正常现象。
 
-本模块默认 `AUTO`：用数据跨度与 cfg 声明的量程跨度比对来自动判定，判定结果记入诊断（`DAT-009`），可用 `ascii_scaling=always/never` 覆盖。调研的四个开源解析器**都没有做这个判定**。
+本模块的处理：默认按标准换算；当数据跨度远小于声明量程时给出 `DAT-009` **提示**
+（不改变换算行为），确认某文件确实存的是工程量时，用 `ascii_scaling="never"` 显式跳过。
+
+> 早期版本曾用该判据**自动**跳过换算，在 11 组真实样例上误判 10 个通道且全部错向"跳过"，
+> 因此改为现在的"默认换算 + 提示"。
 
 ### 3. FLOAT32 的数值语义
 
-FLOAT32 的数值通常已经是工程量，本模块按此处理（跳过 a/b 换算，只做单位与 PS 变比换算），并记录 `DAT-011` 提示。
+FLOAT32 通常直接存工程量，cfg 里的 a/b 按惯例写 `a=1, b=0`。
+本模块对其一视同仁地走 `a/b → 单位 → PS 变比` 链路；当 a/b 不是单位映射时给出 `DAT-011` 提示。
+实测公开样例库中**没有 FLOAT32 样例**，此行为需用客户样例确认。
 
 ### 4. 日期格式 `日/月` vs `月/日`
 
@@ -292,13 +303,13 @@ FLOAT32 的数值通常已经是工程量，本模块按此处理（跳过 a/b �
 ### 运行测试
 
 ```bash
-python tests/run_tests.py          # 124 个测试，不需要 pytest
+python tests/run_tests.py          # 138 个测试，不需要 pytest
 python -m pytest tests             # 装了 pytest 也可以
 ```
 
-### 样例文件
+### 合成样例（自建）
 
-项目目前没有客户真实样例。`tools/make_samples.py` 会合成一套覆盖矩阵完整的录波文件：
+项目自身没有客户样例。`tools/make_samples.py` 会合成一套覆盖矩阵完整的录波文件：
 
 ```bash
 python tools/make_samples.py --out tests/fixtures/generated
@@ -311,14 +322,62 @@ python tools/make_samples.py --out tests/fixtures/generated
 | `v1999_binary` | 标准 1999 版二进制（13 字段 / 5 字段 / time_mult） |
 | `v1991_ascii` | 标准 1991 版 ASCII（10 字段 / 3 字段 / 无 time_mult） |
 | `v2013_binary32` | 2013 版 int32 + time_code/tmq_code 行 |
-| `v2013_float32` | 2013 版 float32（数值为工程量） |
+| `v2013_float32` | 2013 版 float32（数值为工程量、cfg 按惯例写 a=1,b=0） |
 | `v1999_multirate` | 变频采样（1000Hz→4000Hz），验证 endsamp 累计编号语义 |
 | `v1999_missing` | 缺失值哨兵（0x8000） |
 | `v1999_chinese_gbk` | 中文通道名 + GBK 编码 |
-| `v1999_ascii_prescaled` | ASCII 内容已是工程量，验证不二次换算 |
+| `v1999_ascii_smallspan` | 原始计数只用到 ±100（cfg 却声明 ±32767）—— 复现 SEL 等装置现场情形 |
 | `v1999_noisy` | 3% 随机噪声 |
 
-客户样例到位后应加入回归：同一份文件，解析结果必须逐点一致。
+### 真实公开样例库（强烈建议配置）
+
+合成样例只能证明"实现与对标准的理解一致"，证明不了"与现场文件一致"。
+因此支持用真实公开样例库做回归，路径由环境变量指定，**未设置时自动跳过**：
+
+```bash
+# 样本库参考：fault-wave-analyzer/fastapi/tests/fixtures/sample_library/
+# （12 组来自 GitHub MIT 仓库的样例）
+export COMTRADE_SAMPLE_LIBRARY=/path/to/sample_library
+python tests/run_tests.py
+```
+
+也可以用独立工具做完整核查：
+
+```bash
+python tools/validate_library.py --library <样本库目录>
+python tools/validate_library.py --library <目录> --cross-check <另一解析模块的父目录>
+```
+
+`--cross-check` 会把另一个解析器的输出与本模块逐通道对比，
+确认数值差异只来自「单位归一化 × PS 变比」这两步（本模块相对标准实现多做的工作）。
+
+### 实测结果（12 组真实样例 / 186 个通道）
+
+| 指标 | 结果 |
+|---|---|
+| 样例解析成功 | 11/11（第 12 组只有 cfg 无 dat，按设计报 `FIL-003`） |
+| 版本判定 | 1991 / 1999 / 2013 全部正确，含非标年份 1997、2000 |
+| 通道数、记录数 | 全部与基线一致 |
+| 与对照解析器的数值差异 | 186 个通道中：符合「单位×PS变比」**172 个**，双方均为零 14 个，**不符 0 个** |
+| 通道角色识别率 | 121/186 = **65.1%**（其余为直流/频率/计数器/俄文自定义名，按设计标 UNKNOWN 交人工映射） |
+| 时间轴 | 7 组与对照完全一致；4 组差 0.04%~0.1%（见 §10 第 9 条，已提供开关） |
+
+真实数据暴露并已修复的缺陷，记录在此以免重蹈：
+
+1. **`nrates=0` 但随后仍给出采样率行**（SEL 的 `0,20700`、Wisp 的 `0,  1360`）。
+   不消费这一行会导致其后所有行整体错位一行，表现为"起始时间无法解析 → 数据格式无法识别"的致命错误。
+2. **ASCII 的 a/b 换算"自动判定"是错误设计**。原以为可以用"数据跨度 vs 声明量程跨度"
+   判断数据是否已是工程量，实测在真实样例上误判 10 个通道、**全部错向"跳过换算"**。
+   已改为默认按标准换算，跨度判定降级为纯提示（`DAT-009`）。
+3. **编码兜底链被 GB18030 卡死**。GB18030 几乎能解码任意字节序列，
+   放在 latin-1 之前会把俄文、葡文文件都"成功"解成乱码汉字：
+   俄文 `Неизвестный регистратор` → `Íåèçâåñòíûé ðåãèñòðàòîð`，
+   葡文 `Estação de Medição` → `Esta玢o de Medi玢o`。已改为
+   CP1251（俄文）→ GB18030（中文）→ Latin-1 的判定顺序，并加了防误判判据。
+4. **`endsamp` 是采样号不是条数**。有的装置采样号从 0 起（wisp_example2：0~19679、endsamp=19679），
+   直接与记录条数比较会误报。已改为按 `endsamp - 首采样号 + 1` 比较。
+5. **通道名后缀过窄**。`IAX`/`IBY`/`IAT`（不同绕组的三相电流）、`VA(kV)`
+   （单位写在名称里）原先识别不出，放宽后缀规则后识别率 58.1% → 65.1%。
 
 ---
 
@@ -333,13 +392,17 @@ python tools/make_samples.py --out tests/fixtures/generated
 5. **`DAT-002`（文件大小与声明记录数不符）是最有价值的诊断**，实现时务必保留：它能一次性暴露通道数解析错误、版本判定错误、文件截断三类问题。
 6. **诊断按文件聚合，不要逐通道刷屏。** 一个根因（如 ASCII 已换算）只报一条，列出受影响的通道名。
 7. **`declared_no` 不可信。** 现场通道序号有从 0 起、跳号、重复的情况，索引一律用读取顺序 `index`。
-8. **抽样/降采样不要加进解析层。** 波形显示画不动是 F 模块的事；解析层丢数据会连带毁掉特征计算精度。
+8. **`endsamp` 是采样号不是条数，且各装置写法不统一。** 有 0 起编号的（wisp_example2：0~19679、endsamp=19679）、有把 endsamp 写成总条数的（wisp_example5：0~201、endsamp=202）、也有就是差一条的（wisp_example4）。比较时按 `endsamp - 首采样号 + 1` 并容差 ±1 条，只对量级性偏差报警。
+9. **编码判定顺序不能随意调整。** GB18030 几乎能解码任意字节序列，必须放在 CP1251 之后，并加「拉丁文本被误读成汉字」的判据（汉字被夹在两个 ASCII 字母之间），否则俄文、葡文文件会被静默解成乱码。
+10. **抽样/降采样不要加进解析层。** 波形显示画不动是 F 模块的事；解析层丢数据会连带毁掉特征计算精度。
 
 ---
 
 ## 十一、待办
 
-- [ ] 客户样例到位后，用真实文件跑 `python -m comtrade` 做兼容性验证（对应需求 T03/NF-31）
+- [ ] 客户样例到位后，用真实文件跑 `python -m comtrade` 做兼容性验证（对应需求 T03/NF-31）；并据实际文件确定 `time_axis_source` 与 `ascii_scaling` 取值
+- [ ] 用客户文件确认 FLOAT32 的数值语义（公开样例库中没有 FLOAT32 样例）
+- [ ] 确认 `IG`/`IP`（SEL 等装置）、`U21`/`U32`（欧式线电压命名）、`I1`/`I2`/`I3`（与序分量命名冲突）等通道是否需加入别名表 —— 当前一律标 UNKNOWN 交人工映射
 - [ ] 2013 版 `.cff` 单文件格式（当前明确报 `FIL-006`；若客户样例中存在需评估是否列入本期）
 - [ ] 与电力专家确认零序电流口径（`I0` vs `3I0`）
 - [ ] 通道人工映射界面（本模块已把未识别通道隔离到 `UNKNOWN` 并给出 `CHN-001`，映射 UI 属 F 模块）

@@ -266,6 +266,7 @@ def _load_pair(
         diagnostics,
         location=dat_path.name,
         rate_tolerance=options.rate_tolerance,
+        source=options.time_axis_source,
     )
 
     # ------------------------------------------------------- 6. 开关量数据

@@ -136,3 +136,32 @@ def _run_all() -> tuple[int, int]:
     from tests.run_tests import run_module
 
     return run_module(__name__)
+
+def test_role_phase_suffix_variants():
+    """相别后面可跟任意后缀（绕组/支路标识），真实样例里大量出现。
+
+    实测公开样例：IAX/IBX/ICX/IAY/IBY/ICY/IAT/IBT/ICT（不同绕组的三相电流）、
+    VA(kV)/VB(kV)/VC(kV)（单位写在名称里的相电压）。
+    """
+    cases = [
+        ("IAX", ChannelRole.IA), ("IBX", ChannelRole.IB), ("ICX", ChannelRole.IC),
+        ("IAY", ChannelRole.IA), ("IBY", ChannelRole.IB), ("ICY", ChannelRole.IC),
+        ("IAT", ChannelRole.IA), ("IBT", ChannelRole.IB), ("ICT", ChannelRole.IC),
+        ("VA(kV)", ChannelRole.UA), ("VB(kV)", ChannelRole.UB), ("VC(kV)", ChannelRole.UC),
+        ("Ia1", ChannelRole.IA), ("Uan", ChannelRole.UA),
+    ]
+    for name, expected in cases:
+        r = identify(name, "", "current" if expected.value.startswith("I") else "voltage")
+        assert r.role is expected, f"{name!r} -> {r.role}，期望 {expected}"
+
+
+def test_role_phase_to_phase_is_not_guessed():
+    """相别后面紧跟另一个相别字母 → 相间量，含义不确定，不猜。"""
+    for name in ("IAB", "IBC", "ICA", "UABX"):
+        assert identify(name, "", "").role is ChannelRole.UNKNOWN, name
+
+
+def test_role_zero_sequence_voltage_aliases():
+    """部分厂家用 Vo 表示零序电压。"""
+    for name in ("Vo", "V0", "Uo", "UN"):
+        assert identify(name, "", "voltage").role is ChannelRole.U0, name

@@ -83,23 +83,45 @@ def test_binary_always_scaled():
     assert ch.scaling_applied is True
 
 
-def test_ascii_auto_detects_pre_scaled_data():
-    """ASCII 数据跨度远小于声明量程 → 判定已是工程量，跳过换算。"""
+def test_ascii_scales_by_default():
+    """默认按标准施加 a/b 换算 —— 全行业一致的行为。
+
+    早期版本会在这里"自动判定"并跳过换算，但在 11 组真实公开样例
+    （186 个通道）上实测误判 10 个通道、且全部错向"跳过"，
+    因此改为默认换算，跨度判定降级为纯提示。
+    """
+    raw = np.array([[1.0, 2.0, 3.0]])
+    ch = _channel(a=0.01, b=0.0)
+    _run([ch], raw, data_type=DataFileType.ASCII)
+    np.testing.assert_allclose(ch.values, [0.01, 0.02, 0.03])
+    assert ch.scaling_applied is True
+
+
+def test_ascii_small_span_raises_advisory_but_still_scales():
+    """数据跨度远小于声明量程时只给提示，不改变换算行为。"""
     raw = np.array([[1.0, 2.0, 3.0]])  # 跨度 2，声明量程跨度 65534
     ch = _channel(a=0.01, b=0.0)
     diag = _run([ch], raw, data_type=DataFileType.ASCII)
-    np.testing.assert_allclose(ch.values, [1.0, 2.0, 3.0])
-    assert ch.scaling_applied is False
-    assert Code.DAT_ASCII_PRESCALED in diag.codes()
-
-
-def test_ascii_auto_keeps_scaling_for_raw_counts():
-    """ASCII 数据跨度接近声明量程 → 是原始计数，正常换算。"""
-    raw = np.array([[-30000.0, 0.0, 30000.0]])
-    ch = _channel(a=0.01, b=0.0)
-    _run([ch], raw, data_type=DataFileType.ASCII)
+    np.testing.assert_allclose(ch.values, [0.01, 0.02, 0.03])
     assert ch.scaling_applied is True
-    np.testing.assert_allclose(ch.values, [-300.0, 0.0, 300.0])
+    hits = [d for d in diag if d.code == Code.DAT_ASCII_PRESCALED]
+    assert hits, "应当给出疑似已是工程量的提示"
+    assert "never" in hits[0].message
+
+
+def test_span_advisory_not_raised_for_binary():
+    """二进制整型必然是原始计数，不该给"疑似已换算"提示。"""
+    raw = np.array([[1, 2, 3]], dtype=np.int32)
+    ch = _channel(a=0.01, b=0.0)
+    diag = _run([ch], raw, data_type=DataFileType.BINARY)
+    assert Code.DAT_ASCII_PRESCALED not in diag.codes()
+
+
+def test_span_advisory_not_raised_for_identity_scaling():
+    raw = np.array([[1.0, 2.0, 3.0]])
+    ch = _channel(a=1.0, b=0.0)
+    diag = _run([ch], raw, data_type=DataFileType.ASCII)
+    assert Code.DAT_ASCII_PRESCALED not in diag.codes()
 
 
 def test_ascii_scaling_override():
@@ -244,8 +266,8 @@ def test_multiple_channels_produce_one_aggregated_diagnostic():
     assert "5 个通道" in hits[0].message
 
 
-def test_float32_skipping_scaling_is_info_not_warning():
-    """FLOAT32 里数值就是工程量，属常规做法，不该报成警告。"""
+def test_float32_nonidentity_scaling_is_reported_as_info():
+    """FLOAT32 通常直接存工程量（a=1,b=0）；带非单位系数时要给出提示。"""
     from comtrade.diagnostics import Severity
 
     raw = np.array([[1.5, 2.5, 3.5]])
@@ -253,3 +275,4 @@ def test_float32_skipping_scaling_is_info_not_warning():
     diag = _run([ch], raw, data_type=DataFileType.FLOAT32)
     hits = [d for d in diag if d.code == Code.DAT_FLOAT32_SCALED]
     assert hits and hits[0].severity is Severity.INFO
+    np.testing.assert_allclose(ch.values, [0.015, 0.025, 0.035])

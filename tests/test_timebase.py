@@ -151,3 +151,35 @@ def test_time_axis_is_monotonic_for_normal_input():
     axis, diag = _build([(4000.0, 1000)], 1000)
     assert np.all(np.diff(axis) > 0)
     assert Code.TIM_NOT_MONOTONIC not in diag.codes()
+
+
+def test_source_option_switches_priority():
+    """时间轴优先依据可切换 —— 项目内两套实现的分歧点，必须可配置。"""
+    ts = np.arange(4, dtype=np.int64) * 250  # 4 个采样点，时标间隔 250us(=4000Hz)
+    segments = [(8000.0, 4)]  # 声明 8000Hz，与时标不符
+
+    diag_a = DiagnosticCollector()
+    axis_rates = build_time_axis(
+        _meta(segments), np.arange(1, 5), ts, diag_a, source="rates",
+        rate_tolerance=10.0,
+    )
+    diag_b = DiagnosticCollector()
+    axis_ts = build_time_axis(
+        _meta(segments), np.arange(1, 5), ts, diag_b, source="timestamps",
+        rate_tolerance=10.0,
+    )
+
+    # rates 优先：按 8000Hz
+    assert abs(axis_rates[1] - 1 / 8000.0) < 1e-12
+    # timestamps 优先：按 250us
+    assert abs(axis_ts[1] - 0.00025) < 1e-12
+
+
+def test_source_option_falls_back_when_preferred_unavailable():
+    """指定的依据不可用时，自动退到另一种。"""
+    # nrates=0 且时标全 0 → 两者都不可用，退化按索引
+    diag = DiagnosticCollector()
+    axis = build_time_axis(
+        _meta([]), np.arange(1, 4), np.zeros(3, dtype=np.int64), diag, source="timestamps"
+    )
+    assert axis.size == 3

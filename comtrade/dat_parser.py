@@ -262,14 +262,10 @@ def _assemble_ascii(
     n = data.shape[0]
     columns = data.shape[1]
 
-    if n < declared_count:
-        diagnostics.warn(
-            Code.DAT_RECORD_SHORT,
-            f"实际采样点数 {n} 少于 cfg 声明的 {declared_count}，数据可能被截断",
-            location="",
-        )
-
     sample_numbers = data[:, 0].astype(np.int64)
+    _check_record_count(
+        n, declared_count, int(sample_numbers[0]) if n else None, diagnostics, ""
+    )
     timestamps = data[:, 1].astype(np.int64)
 
     a_hi = min(2 + analog_count, columns)
@@ -346,22 +342,10 @@ def _parse_binary(
         )
         raise ParseAbort("dat 记录不完整")
 
-    # ------------------------------------------------------ 记录数交叉校验
-    if declared_count and full_records != declared_count:
-        diff = full_records - declared_count
-        diagnostics.warn(
-            Code.DAT_SIZE_MISMATCH,
-            f"按记录长度推算的采样点数 {full_records} 与 cfg 声明的 {declared_count} "
-            f"不一致（相差 {diff:+d}）。请检查通道数量、版本判定或文件是否损坏",
-            location=dat_path.name,
-            detail=f"文件 {file_size} 字节 / 记录 {rec_size} 字节",
-        )
-        if diff < 0:
-            diagnostics.warn(
-                Code.DAT_RECORD_SHORT,
-                "实际记录数少于声明值，数据可能被截断",
-                location=dat_path.name,
-            )
+    # 记录数交叉校验推迟到读完采样号之后（见 _check_record_count）：
+    # cfg 的 endsamp 是**采样号**不是条数，必须减去首采样号才能与条数比较。
+    # 实测有 0 起编号的现场文件（wisp_example2：采样号 0~19679、endsamp=19679），
+    # 不减去首采样号会误报一条"记录数不符"。
 
     try:
         arr = np.fromfile(dat_path, dtype=rec_dtype, count=full_records)
@@ -387,6 +371,11 @@ def _parse_binary(
     if words > 0 and digital_count > 0:
         digital = _unpack_digital(arr["digital"], digital_count, diagnostics, dat_path.name)
 
+    if arr.size:
+        _check_record_count(
+            int(arr.size), declared_count, int(arr["samp"][0]), diagnostics, dat_path.name
+        )
+
     diagnostics.info(
         "DAT-OK",
         f"{data_type.value} 数据解析完成：{arr.size} 个采样点，记录长度 {rec_size} 字节",
@@ -402,6 +391,57 @@ def _parse_binary(
         declared_count=declared_count,
         digital_word_count=words,
     )
+
+
+def declared_expected_count(declared_end_sample: int, first_sample_number: int | None) -> int:
+    """把 cfg 的"结束采样号"换算成期望的记录**条数**。
+
+    ``endsamp`` 是采样号（含），不是条数：标准写法采样号从 1 起，
+    条数 = endsamp；实测也有从 0 起的（wisp_example2），条数 = endsamp + 1。
+    统一按 ``endsamp - 首采样号 + 1`` 计算。
+    """
+    base = 1 if first_sample_number is None else int(first_sample_number)
+    return int(declared_end_sample) - base + 1
+
+
+#: 记录条数的容差。真实文件在"endsamp 是末采样号还是总条数"上并不统一，
+#: 有的装置就是差一条（实测 wisp_example4：endsamp=2399 但有 2400 条；
+#: wisp_example5：0 起编号、endsamp=202 恰为条数）。这条校验的价值在于发现
+#: **量级性**的错误（通道数解析错、版本判错、文件被截断），±1 条没有意义。
+_RECORD_COUNT_TOLERANCE = 1
+
+
+def _check_record_count(
+    actual: int,
+    declared_end_sample: int,
+    first_sample_number: int | None,
+    diagnostics: DiagnosticCollector,
+    location: str,
+) -> None:
+    """记录条数与 cfg 声明的一致性校验。
+
+    这是**最有价值的诊断之一**：一旦出现量级性偏差，通常说明通道数量解析错误、
+    版本判定错误或文件被截断。±1 条以内的偏差按容差忽略（见上文说明）。
+    """
+    if not declared_end_sample:
+        return
+    expected = declared_expected_count(declared_end_sample, first_sample_number)
+    diff = actual - expected
+    if abs(diff) <= _RECORD_COUNT_TOLERANCE:
+        return
+    diagnostics.warn(
+        Code.DAT_SIZE_MISMATCH,
+        f"实际记录数 {actual} 与 cfg 声明推算的 {expected} 不一致（相差 {diff:+d} 条；"
+        f"cfg 结束采样号 {declared_end_sample}、首采样号 {first_sample_number}）。"
+        "请检查通道数量、版本判定或文件是否损坏",
+        location=location,
+    )
+    if diff < 0:
+        diagnostics.warn(
+            Code.DAT_RECORD_SHORT,
+            "实际记录数明显少于声明值，数据可能被截断",
+            location=location,
+        )
 
 
 def _unpack_digital(

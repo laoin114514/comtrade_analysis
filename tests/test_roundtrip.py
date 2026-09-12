@@ -139,13 +139,26 @@ def test_chinese_gbk_names_are_decoded_and_identified():
     assert ChannelRole.IA in roles and ChannelRole.I0 in roles
 
 
-def test_ascii_prescaled_sample_is_not_double_scaled():
-    """ASCII 已经是工程量的样例：不能二次换算，且必须留下诊断。"""
-    recording, diags = try_load_recording(FIXTURES / "v1999_ascii_prescaled.cfg")
+def test_ascii_small_span_sample_is_scaled_and_advisory_fires():
+    """ASCII 原始计数相对声明量程偏小 —— 真实文件里很常见（SEL 装置即如此）。
+
+    必须仍按标准施加 a/b 换算；只给出 DAT-009 提示，
+    绝不能据此跳过换算（早期版本这样做，在真实样例上 100% 误判）。
+    """
+    recording, diags = try_load_recording(FIXTURES / "v1999_ascii_smallspan.cfg")
     assert recording is not None
     ia = recording.require_role(ChannelRole.IA).values
     assert abs(_rms(ia[:400]) - EXPECTED_I_PRE) / EXPECTED_I_PRE < 0.01
     assert any(d.code == "DAT-009" for d in diags)
+
+
+def test_float32_sample_uses_identity_coefficients():
+    """FLOAT32 按现场惯例在 cfg 里写 a=1,b=0，数值即工程量。"""
+    recording = load_recording(FIXTURES / "v2013_float32.cfg")
+    ch = recording.analog_channels[0]
+    assert ch.a == 1.0 and ch.b == 0.0
+    ia = recording.require_role(ChannelRole.IA).values
+    assert abs(_rms(ia[:400]) - EXPECTED_I_PRE) / EXPECTED_I_PRE < 0.01
 
 
 def test_1991_sample_has_no_ratio_fields():

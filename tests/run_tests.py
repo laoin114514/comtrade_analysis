@@ -26,6 +26,7 @@ MODULES = (
     "tests.test_timebase",
     "tests.test_reader",
     "tests.test_roundtrip",
+    "tests.test_real_samples",
 )
 
 
