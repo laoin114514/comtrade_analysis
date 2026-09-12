@@ -49,6 +49,92 @@ def test_unit_kind_classification():
     assert parse_unit("Hz").kind == "frequency"
 
 
+#: SI 词头里 M(10^6) 与 m(10^-3) 只差大小写，µ/μ 又容易被当排版字符删掉。
+#: 这张表按 SI 的规范写法逐个核对 —— 期望值写死，对不上就报错。
+_SI_SCALE_EXPECTED: dict[str, float] = {
+    # 电压
+    "V": 1.0, "mV": 1e-3, "kV": 1e3, "MV": 1e6,
+    "uV": 1e-6, "µV": 1e-6, "μV": 1e-6,          # ASCII u / U+00B5 / U+03BC
+    # 电流
+    "A": 1.0, "mA": 1e-3, "kA": 1e3, "MA": 1e6,
+    "uA": 1e-6, "µA": 1e-6, "μA": 1e-6,
+    # 功率
+    "W": 1.0, "mW": 1e-3, "kW": 1e3, "MW": 1e6,
+    "var": 1.0, "kvar": 1e3, "Mvar": 1e6,
+    "VA": 1.0, "kVA": 1e3, "MVA": 1e6,
+    # 大小写无关的写法（KV/KA 这类现场常见）
+    "KV": 1e3, "KA": 1e3, "kv": 1e3, "ka": 1e3,
+    "kW一次": 1e3, "(kV)": 1e3, " kV ": 1e3,
+}
+
+
+def test_unit_si_case_is_significant():
+    """回归：大小写有语义的写法必须按 SI 解析，不能被小写化抹平。
+
+    原实现先 lower() 再查表，于是 MV（兆伏）撞上 mV（毫伏）、MA 撞上 mA，
+    静默差 10^9 倍；µV/µA 里的 µ 被清洗正则当排版字符删掉，退化成 V/A，差 10^6 倍。
+    两者都检测不到的原因是 recognized 仍为 True —— 一条诊断都不会发出。
+    """
+    wrong: list[str] = []
+    for raw, expected in _SI_SCALE_EXPECTED.items():
+        info = parse_unit(raw)
+        if not info.recognized or info.scale != expected:
+            wrong.append(
+                f"{raw}: scale={info.scale:g} recognized={info.recognized}（应为 {expected:g}）"
+            )
+    assert not wrong, "以下写法的倍率与 SI 不一致：" + "；".join(wrong)
+
+
+def test_unit_milli_and_mega_never_collide():
+    """同一字母的大小写两义必须产生不同的倍率 —— 撞在一起就是 10^9 倍偏差。"""
+    for milli, mega in (("mV", "MV"), ("mA", "MA"), ("mW", "MW")):
+        low, high = parse_unit(milli), parse_unit(mega)
+        assert low.recognized and high.recognized, f"{milli}/{mega} 都应识别"
+        assert high.scale / low.scale == 1e9, (
+            f"{milli}({low.scale:g}) 与 {mega}({high.scale:g}) 的倍率关系不对"
+        )
+
+
+def test_unit_micro_sign_is_not_stripped():
+    """µ/μ 参与语义，不能被当排版字符丢掉（丢掉会让 µV 退化成 V，差 10^6 倍）。"""
+    for raw in ("uV", "µV", "μV", "uA", "µA", "μA"):
+        info = parse_unit(raw)
+        assert info.recognized is True, raw
+        assert info.scale == 1e-6, f"{raw} 的倍率应为 1e-6，实际 {info.scale:g}"
+
+
+def test_unit_unresolvable_spellings_fall_back_to_unrecognized():
+    """确实无法判定的写法宁可标"未识别"（不缩放 + CHN-003），也不要猜。
+
+    与通道角色识别同一条原则："宁可标不出来让用户手工映射，也不要标错。"
+    """
+    for raw in ("mva", "毫伏", "微伏", "兆伏", "kWh"):
+        info = parse_unit(raw)
+        assert info.recognized is False, (
+            f"{raw} 无法判定意图，应当落到未识别分支；实际 scale={info.scale:g}"
+        )
+        assert info.scale == 1.0, "未识别时不得缩放"
+
+
+def test_unit_sloppy_mv_ma_mw_keep_documented_reading():
+    """全小写/随意大小写的 mv、ma、mw 保留"现场最可能"的取值。
+
+    这是**刻意保留的兼容行为**，不是 SI 判定：这三个写法在现场很常见，
+    改成"未识别"会让原本按毫伏/毫安正确处理的通道反过来完全不缩放（差 1000 倍），
+    风险比"把兆当成毫"更大。取值依据见 units._UNIT_MAP 的注释。
+    大小写规范的写法由 _CASE_SIGNIFICANT_UNITS 精确判定，不受本策略影响。
+    """
+    assert parse_unit("mv").scale == 1e-3
+    assert parse_unit("Mv").scale == 1e-3
+    assert parse_unit("ma").scale == 1e-3
+    assert parse_unit("mw").scale == 1e6  # 功率取兆：毫瓦在电力录波里没有意义
+
+    # 与规范写法区分开：这正是本次修好的部分
+    assert parse_unit("MV").scale == 1e6
+    assert parse_unit("MA").scale == 1e6
+    assert parse_unit("mW").scale == 1e-3
+
+
 # ---------------------------------------------------------------------------
 # 通道角色识别
 # ---------------------------------------------------------------------------

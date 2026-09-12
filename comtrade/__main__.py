@@ -98,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
                     "a": ch.a,
                     "b": ch.b,
                     "ps": ch.ps,
+                    "ps_raw": ch.ps_raw,
                     "primary": ch.primary,
                     "secondary": ch.secondary,
                     "invalid_count": ch.invalid_count,

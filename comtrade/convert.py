@@ -6,11 +6,15 @@
     P-06（统一内部数据格式）、E-01/E-02（有效值精度）、NF-32（通道数据兼容）
 
 转换链（顺序不可调换）
-    1. 识别缺失值哨兵   → 标记为无效（必须在换算之前，否则哨兵会被换算成"看似正常"的值）
+    1. 识别缺失的采样点 → 缺失值哨兵与解析期 NaN（ASCII 空字段）都标记为无效
+                          （必须在换算之前，否则哨兵会被换算成"看似正常"的值）
     2. 取值范围校验     → 记录诊断（字节序错误、量程不符会在这里暴露）
     3. a/b 换算         → ``工程值 = a × 原始值 + b``
     4. 单位归一化       → kV→V、kA→A
-    5. 一次/二次值换算  → 按 PS 字段与变比换算到一次值
+    5. 一次/二次值换算  → 按 PS 字段与变比换算到一次值。
+       未执行时按原因分别告警：文件没有变比字段（1991 版 / 10 字段行）按 INFO，
+       **字段存在但读不出来按 WARNING**（CHN-006）—— 后者数值会偏小变比倍数，
+       而二次值本身看起来正常，静默通过会让算法模块误判。
     6. 无效点置 NaN
 
     **换算在解析层只做一次。** 如果留给波形、算法模块各自做，
@@ -61,6 +65,16 @@ _R_A_ZERO = "a_zero"
 _R_SCALED = "scaled"
 _R_IDENTITY = "identity"
 _R_NEVER = "never"
+
+#: 变比（PS）换算未执行的原因标签，见 :func:`_apply_ratio`
+_RATIO_PS_UNREADABLE = "ps_unreadable"
+"""PS 字段存在但为空或无法识别 —— 变比信息在文件里，只是数值基准读不出来（CHN-006）。"""
+
+_RATIO_NO_FIELD = "no_ratio_field"
+"""文件没有 PS / 变比字段（1991 版，或 1999+ 的 10 字段行）—— 无信息可用（CHN-004）。"""
+
+_RATIO_INCOMPLETE = "ratio_incomplete"
+"""声明为二次值（PS=S）但变比缺失或非法 —— 无法完成换算（CHN-004）。"""
 
 
 def looks_like_missing_value(count: int, fraction: float, size: int) -> bool:
@@ -120,6 +134,7 @@ def convert_analog_channels(
     float32_nonidentity: list[str] = []
     missing_hits: list[tuple[str, int]] = []
     out_of_range: list[tuple[str, int]] = []
+    ratio_issues: dict[str, list[AnalogChannel]] = {}
 
     for ch in channels:
         if ch.index >= analog_raw.shape[0]:
@@ -151,6 +166,17 @@ def convert_analog_channels(
                         f"{sentinel:g}，占比过高，判断为该值属于正常数据，未做屏蔽",
                         location=location,
                     )
+
+        # ------------------------------------------- 1b. 解析期产生的非有限值
+        # ASCII 空字段在解析期就变成 NaN，它既不匹配哨兵，也不会被下面的范围校验
+        # 捕获（NaN 与任何数比较都是 False）。不并进掩码就会让 invalid_mask /
+        # invalid_count / has_invalid 全部漏报 —— 值里明明有 NaN，却说"没有无效点"，
+        # 下游据 has_invalid 判断"该通道能否参与计算"时会被误导（算出 NaN 而无提示）。
+        # 哨兵的占比守卫不适用于这里：NaN 本来就不是有效数据，不存在"误伤正常值"的问题。
+        non_finite = ~np.isfinite(raw)
+        if non_finite.any():
+            invalid |= non_finite
+            missing_hits.append((ch.name, int(non_finite.sum())))
 
         # -------------------------------------------------- 2. 取值范围校验
         if ch.raw_max > ch.raw_min:
@@ -192,7 +218,9 @@ def convert_analog_channels(
         ch.unit = unit_info.canonical or ch.unit_raw
 
         # ------------------------------------- 5. 一次值 / 二次值换算（PS）
-        _apply_ratio(ch, values, diagnostics, options, location)
+        ratio_issue = _apply_ratio(ch, values, options)
+        if ratio_issue is not None:
+            ratio_issues.setdefault(ratio_issue, []).append(ch)
 
         # ------------------------------------------------------ 6. 无效点置 NaN
         if invalid.any():
@@ -204,6 +232,7 @@ def convert_analog_channels(
     # ------------------------------------------------------------ 汇总诊断
     _report(diagnostics, location, missing_hits, out_of_range,
             prescaled, scale_skipped, never_skipped, float32_nonidentity)
+    _report_ratio_issues(diagnostics, location, version, ratio_issues)
 
 
 def _report(
@@ -222,7 +251,8 @@ def _report(
         preview = "、".join(f"{name}({n})" for name, n in missing_hits[:6])
         diagnostics.info(
             Code.DAT_MISSING_VALUE,
-            f"检测到 {total} 个缺失值采样点，已标记为无效（NaN）：{preview}"
+            f"检测到 {total} 个缺失的采样点（缺失值哨兵或 ASCII 空字段），"
+            f"已标记为无效（NaN）：{preview}"
             + ("…" if len(missing_hits) > 6 else ""),
             location=location,
         )
@@ -332,50 +362,110 @@ def _prescaled_suspicion(
 def _apply_ratio(
     ch: AnalogChannel,
     values: np.ndarray,
-    diagnostics: DiagnosticCollector,
     options: ParseOptions,
-    location: str,
-) -> None:
+) -> str | None:
     """按 PS 字段把数值统一到一次值。
 
     ``PS = S`` → 文件中是二次值，需乘 ``primary / secondary``；
     ``PS = P`` → 已是一次值，不动。
 
-    注意
-        1991 版没有 PS 与变比字段，无论哪种情况都无法做这一步换算，
-        结果保持在 a/b 换算后的量级（通常是二次值）。这一点必须让下游知道，
-        否则算法模块会把二次值当成一次值去和额定值比较。
+    Returns:
+        未做换算的原因标签（见 ``_RATIO_*``）；已换算或无需换算时返回 ``None``。
+
+    为什么返回原因而不是就地记诊断
+        "数值基准不明"要按文件维度聚合报告（README §10 第 6 条），
+        逐通道记诊断会在多通道文件里刷屏；而且原因不同、等级与文案都不同
+        （见 :func:`_report_ratio_issues`）。
+
+    关于 PS 读不出来（``ps is None``）的两种情况
+        必须分开处理，早期版本把两者都当成"1991 版"：
+
+        * 文件里**没有**这个字段（1991 版，或 1999+ 写成 10 字段行）——
+          无信息可用，只能提示数值可能是二次值；
+        * 字段**存在但为空或非法** —— 变比信息其实在文件里，只是数值基准读不出来。
+          此时不做换算会让数值偏小变比倍数（CT 400/1 就是 400 倍），
+          而二次值本身看起来完全正常，静默通过会直接导致算法模块误判。
+          因此按 WARNING 显式告警（``CHN-006``），并给出变比让使用者自行核对。
     """
     if not options.apply_ratio_conversion:
-        return
+        return None
 
     if ch.ps is None:
-        # 1991 版：无变比信息。只在通道确实有单位时提示一次，
-        # 避免无意义地刷屏（无单位通道本身就不可用于定量比较）。
-        if ch.unit_raw:
-            diagnostics.info(
-                Code.CHN_RATIO_MISSING,
-                f"通道「{ch.name}」所在文件为 1991 版，没有一次/二次变比字段，"
-                "数值为 a/b 换算结果（通常为二次值），未做一次值换算",
-                location=location,
-            )
-        return
+        return _RATIO_NO_FIELD if ch.ps_raw is None else _RATIO_PS_UNREADABLE
 
     if ch.ps != "S":
-        return
+        return None
 
     if not ch.primary or not ch.secondary or ch.secondary == 0:
-        diagnostics.warn(
-            Code.CHN_RATIO_MISSING,
-            f"通道「{ch.name}」标记为二次值（PS=S）但缺少有效变比"
-            f"（primary={ch.primary}, secondary={ch.secondary}），未做一次值换算；"
-            "该通道的绝对值不可与一次值通道直接比较",
-            location=location,
-        )
-        return
+        return _RATIO_INCOMPLETE
 
     values *= ch.primary / ch.secondary
     ch.ratio_applied = True
+    return None
+
+
+def _report_ratio_issues(
+    diagnostics: DiagnosticCollector,
+    location: str,
+    version: ComtradeVersion,
+    issues: dict[str, list[AnalogChannel]],
+) -> None:
+    """报告一次值/二次值换算未执行的情况（按文件聚合，一个根因一条诊断）。
+
+    三种情况的危害与等级不能混为一谈 —— 混在一起正是"数值静默偏小变比倍数"
+    这类缺陷的温床：
+    ``CHN-006``（PS 读不出来）数值会偏小变比倍数，是 WARNING；
+    ``CHN-004`` 的两种情形都无换算可做，按 INFO 如实告知。
+    """
+    def preview(channels: list[AnalogChannel], limit: int = 6) -> str:
+        names = "、".join(ch.name for ch in channels[:limit])
+        return names + ("…" if len(channels) > limit else "")
+
+    unreadable = issues.get(_RATIO_PS_UNREADABLE, [])
+    if unreadable:
+        # 把变比一并写进提示：使用者据此一眼就能判断"数值是不是恰好小了这么多倍"，
+        # 从而在几秒内决定该把 PS 补成 P 还是 S。
+        detail = "、".join(
+            f"{ch.name}（PS=「{ch.ps_raw}」"
+            + (f"，变比 {ch.primary:g}/{ch.secondary:g}" if ch.primary and ch.secondary
+               else "，且未提供变比")
+            + "）"
+            for ch in unreadable[:4]
+        )
+        diagnostics.warn(
+            Code.CHN_PS_UNREADABLE,
+            f"有 {len(unreadable)} 个通道的 PS 字段存在但内容为空或无法识别，"
+            "无法判定数值是一次值还是二次值，未做一次值换算。"
+            "PS=S 时数值应乘变比换算到一次侧，漏掉这一步会让数值偏小变比倍数"
+            "（例如 CT 400/1 就小 400 倍），而二次值的数值本身看起来是正常的；"
+            "请核对 cfg 中这些通道的 PS 字段（标准取值为 P 或 S）：" + detail
+            + ("…" if len(unreadable) > 4 else ""),
+            location=location,
+        )
+
+    no_field = issues.get(_RATIO_NO_FIELD, [])
+    if no_field:
+        why = (
+            "文件为 COMTRADE 1991，没有 PS 与一次/二次变比字段"
+            if version is ComtradeVersion.V1991
+            else "文件的模拟通道为 10 字段格式，没有 PS 与一次/二次变比字段"
+        )
+        diagnostics.info(
+            Code.CHN_RATIO_MISSING,
+            f"有 {len(no_field)} 个通道未做一次值换算：{why}，"
+            f"数值为 a/b 换算结果（通常为二次值）：{preview(no_field)}",
+            location=location,
+        )
+
+    incomplete = issues.get(_RATIO_INCOMPLETE, [])
+    if incomplete:
+        diagnostics.warn(
+            Code.CHN_RATIO_MISSING,
+            f"有 {len(incomplete)} 个通道标记为二次值（PS=S）但变比缺失或非法"
+            "（primary/secondary 为空或为 0），未做一次值换算；"
+            "这些通道的绝对值不可与一次值通道直接比较：" + preview(incomplete),
+            location=location,
+        )
 
 
 __all__ = [

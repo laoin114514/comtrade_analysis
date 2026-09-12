@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from comtrade.convert import convert_analog_channels, missing_sentinel
-from comtrade.diagnostics import Code, DiagnosticCollector
+from comtrade.diagnostics import Code, DiagnosticCollector, Severity
 from comtrade.models import AnalogChannel, ComtradeVersion, DataFileType
 from comtrade.options import AsciiScaling, ParseOptions
 
@@ -59,6 +59,40 @@ def test_missing_masking_can_be_disabled():
     ch = _channel(a=1.0, b=0.0)
     _run([ch], raw, options=ParseOptions(mask_missing_values=False))
     assert not np.isnan(ch.values[1])
+
+
+def test_non_finite_values_are_marked_invalid():
+    """解析期产生的 NaN（ASCII 空字段）也必须进无效掩码。
+
+    回归 —— NaN 既不匹配缺失值哨兵，也不会被范围校验捕获（与任何数比较都是 False），
+    于是 values 里明明有 NaN，invalid_mask / invalid_count / has_invalid 却都说没有：
+    下游据 has_invalid 判断"该通道能否参与计算"就会被误导，算出 NaN 而无提示。
+    """
+    raw = np.array([[100.0, np.nan, 300.0]])
+    ch = _channel(a=2.0, b=10.0)
+    diag = _run([ch], raw, data_type=DataFileType.ASCII)
+
+    assert ch.has_invalid is True
+    assert ch.invalid_count == 1
+    assert bool(ch.invalid_mask[1]) is True
+    assert np.isnan(ch.values[1])
+    assert ch.values[0] == 210.0, "其余采样点照常换算"
+    assert Code.DAT_MISSING_VALUE in diag.codes()
+
+
+def test_non_finite_stays_invalid_when_sentinel_masking_is_off():
+    """关掉哨兵屏蔽也照样算无效点。
+
+    NaN 本来就是无效数据，不需要"转换"，也就不存在"误伤正常值"的风险 ——
+    哨兵那套占比守卫在这里不适用。
+    """
+    raw = np.array([[100.0, np.nan]])
+    ch = _channel(a=1.0, b=0.0)
+    _run([ch], raw, data_type=DataFileType.ASCII,
+         options=ParseOptions(mask_missing_values=False))
+
+    assert ch.invalid_count == 1
+    assert bool(ch.invalid_mask[1]) is True
 
 
 def test_implausible_sentinel_share_is_not_masked():
@@ -201,6 +235,65 @@ def test_ps_secondary_without_ratio_warns():
     ch = _channel(a=1.0, b=0.0, primary=None, secondary=None, ps="S")
     diag = _run([ch], raw, data_type=DataFileType.ASCII)
     assert Code.CHN_RATIO_MISSING in diag.codes()
+
+
+def test_ps_field_blank_warns_and_keeps_raw_values():
+    """PS 字段存在但为空：变比信息其实在文件里，只是数值基准读不出来。
+
+    回归 —— 早期实现把它与"1991 版没有该字段"混为一谈，于是同时出现三个问题：
+    * 数值静默偏小变比倍数（CT 400/1 就差 400 倍），而二次值本身看起来正常；
+    * 诊断说"所在文件为 1991 版"，与文件头声明矛盾；
+    * 等级只有 INFO，界面按 WARNING 过滤时完全看不到。
+    """
+    raw = np.array([[1.0, 2.0]])
+    ch = _channel(a=1.0, b=0.0, primary=400.0, secondary=1.0, ps=None, ps_raw="")
+    diag = _run([ch], raw, data_type=DataFileType.ASCII)
+
+    # 不猜测数值基准：保持 a/b 换算结果，但必须报警，由人工核对后决定
+    np.testing.assert_allclose(ch.values, [1.0, 2.0])
+    assert ch.ratio_applied is False
+
+    entry = [d for d in diag if d.code == Code.CHN_PS_UNREADABLE]
+    assert entry, f"PS 为空必须告警，实际诊断：{diag.codes()}"
+    assert entry[0].severity is Severity.WARNING
+    assert "1991" not in entry[0].message, "不得再说成 1991 版（文件头声明是 1999）"
+    assert "400" in entry[0].message, "应给出变比，便于核对数值是否恰好差了这么多倍"
+    assert Code.CHN_RATIO_MISSING not in diag.codes(), "两种情况不应混用同一个码"
+
+
+def test_ps_field_absent_is_info_not_warning():
+    """1991 版没有 PS 字段是正常情况 —— 只提示，不算警告。
+
+    与上一条的区别就是"信息在不在文件里"：没有字段时无换算可做，
+    按 INFO 如实告知即可，不该让界面标黄。
+    """
+    raw = np.array([[1.0]])
+    ch = _channel(a=1.0, b=0.0, primary=None, secondary=None, ps=None, ps_raw=None)
+    diag = _run([ch], raw, data_type=DataFileType.ASCII, version=ComtradeVersion.V1991)
+
+    entry = [d for d in diag if d.code == Code.CHN_RATIO_MISSING]
+    assert entry and entry[0].severity is Severity.INFO
+    assert Code.CHN_PS_UNREADABLE not in diag.codes()
+
+
+def test_ratio_diagnostics_are_aggregated_per_file():
+    """一个根因只出一条诊断，不逐通道刷屏（README §10 第 6 条）。
+
+    回归：原实现逐通道记诊断，7 个通道的同一问题会刷 7 条，
+    既淹掉界面，也让人误以为存在多个不同的问题。
+    """
+    raw = np.zeros((3, 4))
+    channels = [
+        _channel(index=i, name=name, a=1.0, b=0.0,
+                 primary=400.0, secondary=1.0, ps=None, ps_raw="")
+        for i, name in enumerate(("Ia", "Ib", "Ic"))
+    ]
+    diag = _run(channels, raw, data_type=DataFileType.ASCII)
+
+    hits = [d for d in diag if d.code == Code.CHN_PS_UNREADABLE]
+    assert len(hits) == 1, f"应当聚合成一条诊断，实际 {len(hits)} 条"
+    for name in ("Ia", "Ib", "Ic"):
+        assert name in hits[0].message
 
 
 def test_1991_without_ratio_fields_is_reported():

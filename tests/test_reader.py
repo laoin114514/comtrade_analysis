@@ -379,3 +379,84 @@ def test_unreadable_companion_file_is_reported_not_swallowed():
     hits = [d for d in diags if d.code == Code.COMPANION_UNREADABLE]
     assert hits, "伴随文件读取失败必须留痕"
     assert hits[0].location == "companion_bad.hdr", hits[0].location
+
+
+# ---------------------------------------------------------------------------
+# 端到端：PS 字段为空
+# ---------------------------------------------------------------------------
+
+def test_blank_ps_field_is_flagged_end_to_end():
+    """端到端回归：1999 版文件里 PS 字段为空时，必须给出警告级诊断。
+
+    这条链路上的缺陷曾经是**静默**的：PS 字段为空被当作"1991 版没有该字段"处理，
+    于是数值不乘变比（CT 400/1 就偏小 400 倍，实测 1131.4 A 变成 2.83 A），
+    诊断却说"所在文件为 1991 版"（与文件头声明矛盾）、等级只有 INFO ——
+    界面若按 WARNING 及以上过滤，就完全看不到这件事，
+    而二次值的数值本身看起来完全正常。算法模块拿它去比一次值定值必然漏判。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = TempRecording(tmp, "blank_ps")
+        rec.write_cfg(CfgSpec(
+            version=1999,
+            analog=[AnalogDef(name="Ia", phase="A", unit="A",
+                              primary=400.0, secondary=1.0, ps="")],
+            digital=[],
+            segments=[(4000.0, 20)],
+        ))
+        rec.write_binary(np.ones((1, 20)) * 100.0, None)
+
+        recording, diags = try_load_recording(rec.cfg)
+
+    assert recording is not None
+    ia = recording.require_role(ChannelRole.IA)
+    # 不猜测数值基准：保持 a/b 换算结果（400 倍偏差由人工核对后修正）
+    assert ia.values[0] == 100.0
+    assert ia.ratio_applied is False
+    assert ia.ps is None and ia.ps_raw == ""
+
+    hits = [d for d in diags if d.code == Code.CHN_PS_UNREADABLE]
+    assert hits, f"PS 字段为空必须告警，实际诊断：{[d.code for d in diags]}"
+    assert hits[0].severity.value == "warning", "必须是警告级，否则界面不会展示"
+    assert "1991" not in hits[0].message, "不得再把它说成 1991 版文件"
+
+    # 数值基准不明 ≠ 数据损坏：结果仍可用，界面标黄并提示人工确认即可
+    assert recording.is_reliable is True
+
+
+# ---------------------------------------------------------------------------
+# 端到端：ASCII 关键列为空
+# ---------------------------------------------------------------------------
+
+def test_blank_sample_number_does_not_fake_truncation_alarm():
+    """端到端回归：首行采样号为空，不再被误报成"文件被截断"。
+
+    原实现让空采样号经 astype 静默变成 INT64_MIN，而它又被当作"首采样号"
+    参与记录数校验：期望条数被算成 9.2e18，于是报 DAT-002 + DAT-004
+    （"实际记录数明显少于声明值，数据可能被截断"）。这两个码都在
+    不可信码集合里，一份完好的文件就这样被判成 is_reliable=False。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = TempRecording(tmp, "blank_sn")
+        rec.write_cfg(CfgSpec(
+            version=1999,
+            analog=[AnalogDef(name="Ia", phase="A", unit="A", ps="P")],
+            digital=[],
+            data_type="ASCII",
+            segments=[(4000.0, 3)],
+        ))
+        # 首行采样号为空；其余两行正常
+        rec.dat.write_text(",0,100\n2,250,101\n3,500,102\n", encoding="ascii")
+
+        recording, diags = try_load_recording(rec.cfg)
+
+    assert recording is not None
+    assert recording.sample_count == 2, "无法定位的那一行应当被跳过"
+    assert not (recording.sample_numbers == np.iinfo(np.int64).min).any()
+
+    codes = [d.code for d in diags]
+    assert Code.DAT_KEY_FIELD_MISSING in codes, f"必须留痕，实际诊断：{codes}"
+    assert Code.DAT_SIZE_MISMATCH not in codes, "不得再把根因报成'记录数与声明不符'"
+    assert Code.DAT_RECORD_SHORT not in codes, "不得再误报'数据可能被截断'"
+    assert recording.is_reliable is True, "一份完好的文件不该被判为不可信"

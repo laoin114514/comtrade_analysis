@@ -592,8 +592,13 @@ def _parse_analog_channels(
 
         primary = _as_float(get_field(10)) if n >= 13 else None
         secondary = _as_float(get_field(11)) if n >= 13 else None
-        ps_raw = get_field(12).upper() if n >= 13 else ""
-        ps = ps_raw if ps_raw in ("P", "S") else None
+        # PS 的"字段不存在"与"字段为空"必须分开保留：前者是 1991 版的正常情况
+        # （或 1999+ 写成 10 字段行），后者说明变比信息其实在文件里、
+        # 只是数值基准读不出来 —— 两者的危害与诊断等级不同（见 convert._apply_ratio）。
+        # ps_raw 按原文保留（与 phase_raw / unit_raw 一致，便于追溯），判定时忽略大小写。
+        ps_raw = get_field(12) if n >= 13 else None
+        ps_upper = (ps_raw or "").upper()
+        ps = ps_upper if ps_upper in ("P", "S") else None
 
         skew_us = _read_numeric_field(fields, 7, 0.0, "skew", numeric_issues)
         raw_min = _read_numeric_field(fields, 8, 0.0, "min", numeric_issues)
@@ -620,6 +625,7 @@ def _parse_analog_channels(
                 primary=primary,
                 secondary=secondary,
                 ps=ps,
+                ps_raw=ps_raw,
                 unit=unit_info.canonical,
                 role_confidence=0.0,
             )

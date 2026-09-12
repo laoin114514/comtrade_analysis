@@ -88,6 +88,43 @@ def test_analog_field_count_1991_vs_1999():
         assert ch.ps == "S"
 
 
+def test_ps_raw_distinguishes_absent_field_from_blank_field():
+    """PS 的"字段不存在"与"字段存在但为空"必须可区分。
+
+    两者都让 ``ch.ps`` 成为 None，但对下游的意义相反：前者是 1991 版的正常情况
+    （无信息可用，按 INFO 提示），后者说明变比信息在文件里、只是数值基准读不出来
+    （数值会偏小变比倍数，按 WARNING 告警）。convert 模块据此在
+    CHN-004 / CHN-006 之间选择 —— 早期版本区分不了，导致后者静默出错。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        # 1991 版：没有这个字段
+        parsed, _ = _parse_cfg_text(tmp, render_cfg(CfgSpec(version=None)))
+        ch = parsed.analog_channels[0]
+        assert ch.ps is None and ch.ps_raw is None
+
+        # 1999 版但字段为空
+        parsed, _ = _parse_cfg_text(
+            tmp, render_cfg(CfgSpec(version=1999, analog=[AnalogDef(ps="")]))
+        )
+        ch = parsed.analog_channels[0]
+        assert ch.ps is None and ch.ps_raw == ""
+
+        # 现场写小写、写非法值：原文照留，判定忽略大小写
+        parsed, _ = _parse_cfg_text(
+            tmp, render_cfg(CfgSpec(version=1999, analog=[AnalogDef(ps="s")]))
+        )
+        ch = parsed.analog_channels[0]
+        assert ch.ps == "S" and ch.ps_raw == "s"
+
+        parsed, _ = _parse_cfg_text(
+            tmp, render_cfg(CfgSpec(version=1999, analog=[AnalogDef(ps="X")]))
+        )
+        ch = parsed.analog_channels[0]
+        assert ch.ps is None and ch.ps_raw == "X"
+
+
 def test_digital_field_count_1991_vs_1999():
     """1991 版 3 字段，1999 版 5 字段（多出 ph 与 ccbm）。"""
     with tempfile.TemporaryDirectory() as td:

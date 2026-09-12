@@ -147,28 +147,29 @@ def _parse_ascii(
     data = _try_fast_load(dat_path, diagnostics)
 
     if data is not None and data.ndim == 2 and data.shape[1] == expected_columns:
-        diagnostics.info(
-            Code.DAT_OK,
-            f"ASCII 数据解析完成：{data.shape[0]} 个采样点 × {data.shape[1]} 列",
-            location=dat_path.name,
-        )
-        return _assemble_ascii(
-            data,
-            analog_count,
-            digital_count,
-            declared_count,
-            diagnostics,
-            location=dat_path.name,
-        )
+        # 采样号/采样时标含 nan/inf 字面量时不能让快路径通过：这两列会被
+        # astype(int64) 静默转成 INT64_MIN，且快路径无法定位到具体行。
+        # 交给容错解析逐行处理并报告（见 _parse_ascii_tolerant）。
+        if np.isfinite(data[:, :2]).all():
+            diagnostics.info(
+                Code.DAT_OK,
+                f"ASCII 数据解析完成：{data.shape[0]} 个采样点 × {data.shape[1]} 列",
+                location=dat_path.name,
+            )
+            return _assemble_ascii(
+                data,
+                analog_count,
+                digital_count,
+                declared_count,
+                diagnostics,
+                location=dat_path.name,
+            )
 
-    if data is not None and data.ndim == 2 and data.shape[1] != expected_columns:
-        diagnostics.warn(
-            Code.DAT_COLUMN_MISMATCH,
-            f"ASCII 数据列数为 {data.shape[1]}，与 cfg 声明不符"
-            f"（期望 2 + {analog_count} 模拟 + {digital_count} 开关 = {expected_columns}）",
-            location=dat_path.name,
-        )
-
+    # 列数与声明不符时不在这里单独告警：loadtxt 能读出结果就说明**所有行**列数一致，
+    # 那样容错解析一行也匹配不上、直接致命中断 —— 结论统一由容错解析给出。
+    # 否则使用者会先看到"列数不符"的警告、再看到"没有可解析的采样行"的致命错误，
+    # 真正的原因被埋在两条互相矛盾的信息后面（回归案例见
+    # test_ascii_all_rows_column_mismatch_fatal_names_root_cause）。
     return _parse_ascii_tolerant(
         dat_path, analog_count, digital_count, declared_count, expected_columns, diagnostics
     )
@@ -198,13 +199,24 @@ def _parse_ascii_tolerant(
     expected_columns: int,
     diagnostics: DiagnosticCollector,
 ) -> ParsedDat:
-    """逐行容错解析。跳过无法解析的行并记录诊断，保证"坏文件不崩溃"（NF-12）。"""
+    """逐行容错解析。跳过无法解析的行并记录诊断，保证"坏文件不崩溃"（NF-12）。
+
+    列数不符分两种结局，必须给出不同的结论：
+
+    * **部分行不符** —— 跳过坏行后仍能产出数据，记 DAT-007 警告继续（容错的本意）；
+    * **所有行都不符** —— 一行都产不出，此时根因是 cfg 声明与 dat 实际列数不一致，
+      致命诊断必须直接说明这一点，而不是含糊地报"没有可解析的采样行"。
+    """
     text = read_text(dat_path, diagnostics)
     rows: list[list[float]] = []
     bad_rows = 0
     column_mismatch = 0
+    key_missing = 0
+    widths: dict[int, int] = {}
     first_bad_line: int | None = None
     first_bad_detail: str | None = None
+    first_key_line: int | None = None
+    first_key_detail: str | None = None
 
     # 分隔符按首个非空行判定，避免逐行反复探测
     delim = ","
@@ -218,6 +230,7 @@ def _parse_ascii_tolerant(
         if not line:
             continue
         parts = [p.strip() for p in line.split(delim)] if delim else line.split()
+        widths[len(parts)] = widths.get(len(parts), 0) + 1
         if len(parts) != expected_columns:
             column_mismatch += 1
             if first_bad_line is None:
@@ -225,11 +238,63 @@ def _parse_ascii_tolerant(
             continue
         try:
             # 空字段是 1991 版 ASCII 表示"该点未采到"的方式，转为 NaN 而非丢弃整行
-            rows.append([float(p) if p else math.nan for p in parts])
+            row = [float(p) if p else math.nan for p in parts]
         except ValueError:
             bad_rows += 1
             if first_bad_line is None:
                 first_bad_line, first_bad_detail = line_no, line[:120]
+            continue
+
+        # 采样号（第 0 列）与采样时标（第 1 列）必须能定位成一个整数时刻，
+        # 不能像模拟量那样用 NaN 表示"没采到"：NaN 经 astype(int64) 会**静默**
+        # 变成 -9223372036854775808（实测），采样号随之失去意义，下游按采样号
+        # 索引会算出无意义结果；空值落在首行还会让记录数校验算出天文数字、
+        # 误报"文件被截断"。因此这里显式判定并跳过该行，让问题以诊断的形式出现。
+        # 除空字段外，"nan"/"inf" 这类字面量同样落在这里（float() 能解析但不有限）。
+        if not (math.isfinite(row[0]) and math.isfinite(row[1])):
+            key_missing += 1
+            if first_key_line is None:
+                first_key_line, first_key_detail = line_no, line[:120]
+            continue
+
+        rows.append(row)
+
+    if not rows:
+        # 先判根因：列数问题与"内容本身不可解析"要给出不同的致命原因
+        if column_mismatch:
+            diagnostics.fatal(
+                Code.DAT_COLUMN_MISMATCH,
+                f"数据文件的列数为 {_describe_widths(widths)}，与 cfg 声明的 "
+                f"{expected_columns} 列（2 + {analog_count} 个模拟量 + "
+                f"{digital_count} 个开关量）不符，没有任何一行的列数与声明一致。"
+                "多出或缺失的是哪个通道无法确定，因此不按猜测的通道映射解析。"
+                "请核对 cfg 声明的通道数量是否与 dat 一致，或确认 dat 是否被截断",
+                location=f"{dat_path.name}:{first_bad_line}" if first_bad_line else dat_path.name,
+                detail=first_bad_detail or "",
+            )
+            raise ParseAbort("dat 列数与声明不符")
+
+        if key_missing:
+            diagnostics.fatal(
+                Code.DAT_KEY_FIELD_MISSING,
+                f"全部 {key_missing} 行的采样号或采样时标为空/非法，没有任何采样点能定位，"
+                "无法产出数据。请检查该列是否被误删或被别的字段占用",
+                location=f"{dat_path.name}:{first_key_line}",
+                detail=first_key_detail or "",
+            )
+            raise ParseAbort("采样号/采样时标全部缺失")
+
+        # 列数没问题，那是内容本身转不成数值。把行数写进文案 —— 否则
+        # "没有可解析的采样行"会让人以为文件是空的，而它可能有一堆内容，
+        # 只是没有一行能解析。
+        reason = f"（{bad_rows} 行内容无法转换为数值）" if bad_rows else "（文件中没有数据行）"
+        diagnostics.fatal(
+            Code.DAT_EMPTY,
+            f"数据文件中没有可解析的采样行{reason}",
+            location=dat_path.name,
+            detail=first_bad_detail or "",
+        )
+        raise ParseAbort("dat 无可解析内容")
 
     if column_mismatch:
         diagnostics.warn(
@@ -238,6 +303,14 @@ def _parse_ascii_tolerant(
             location=f"{dat_path.name}:{first_bad_line}",
             detail=first_bad_detail or "",
         )
+    if key_missing:
+        diagnostics.warn(
+            Code.DAT_KEY_FIELD_MISSING,
+            f"{key_missing} 行的采样号或采样时标为空/非法，这些采样点无法定位，已跳过"
+            "（其余采样点不受影响；若记录数与 cfg 声明不符，原因就在这里）",
+            location=f"{dat_path.name}:{first_key_line}",
+            detail=first_key_detail or "",
+        )
     if bad_rows:
         diagnostics.warn(
             Code.DAT_VALUE_UNPARSABLE,
@@ -245,14 +318,6 @@ def _parse_ascii_tolerant(
             location=f"{dat_path.name}:{first_bad_line}",
             detail=first_bad_detail or "",
         )
-
-    if not rows:
-        diagnostics.fatal(
-            Code.DAT_EMPTY,
-            "数据文件中没有可解析的采样行",
-            location=dat_path.name,
-        )
-        raise ParseAbort("dat 无可解析内容")
 
     data = np.asarray(rows, dtype=np.float64)
     return _assemble_ascii(
@@ -277,6 +342,22 @@ def _assemble_ascii(
     """把 ASCII 二维数组拆成采样号、时标、模拟量矩阵、开关量矩阵。"""
     n = data.shape[0]
     columns = data.shape[1]
+
+    # 采样号/采样时标必须能转成整数。astype 对非有限值是**静默转换**：
+    # NaN → INT64_MIN（-9223372036854775808），采样号就此失去意义且无任何提示，
+    # 下游按采样号索引会算出无意义结果。上游两条路径都已拦掉这类行
+    # （快路径让位、容错解析逐行跳过），这里再守一道：将来任何新路径往这两列
+    # 塞进非有限值，都会立刻以"不应出现的缺陷"形式暴露，而不是变成垃圾值流向下游。
+    keys = data[:, :2]
+    if not np.isfinite(keys).all():
+        bad = np.flatnonzero(~np.isfinite(keys).all(axis=1))
+        diagnostics.fatal(
+            Code.SYS_UNEXPECTED_ERROR,
+            f"有 {bad.size} 行的采样号或采样时标不是有效数值（首个在第 {int(bad[0]) + 1} 行），"
+            "这些采样点的位置无法确定。这属于解析实现缺陷，请保留该文件反馈",
+            location=location,
+        )
+        raise ParseAbort("采样号/采样时标非有限值")
 
     sample_numbers = data[:, 0].astype(np.int64)
     _check_record_count(
@@ -425,6 +506,23 @@ def declared_expected_count(declared_end_sample: int, first_sample_number: int |
 #: wisp_example5：0 起编号、endsamp=202 恰为条数）。这条校验的价值在于发现
 #: **量级性**的错误（通道数解析错、版本判错、文件被截断），±1 条没有意义。
 _RECORD_COUNT_TOLERANCE = 1
+
+
+def _describe_widths(widths: dict[int, int]) -> str:
+    """把观察到的列数说成人话，供"列数不符"的致命诊断定位根因。
+
+    列数一致时报具体值（最常见的情况：cfg 多声明或少声明了通道）；
+    不一致时报范围 —— 那说明文件本身是拼凑或半截的，与通道数声明无关。
+    """
+    if not widths:
+        return "0"
+    if len(widths) == 1:
+        width, count = next(iter(widths.items()))
+        return f"{width}（{count} 行）"
+    return (
+        f"{min(widths)}~{max(widths)}"
+        f"（{len(widths)} 种，共 {sum(widths.values())} 行）"
+    )
 
 
 def _check_record_count(
