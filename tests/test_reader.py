@@ -328,3 +328,54 @@ def test_cli_ascii_scaling_never_takes_effect():
     assert Code.DAT_SCALING_DISABLED in codes, (
         f"--ascii-scaling never 未生效（若是 a/b 换算被照常施加，说明选项被忽略）。诊断：{codes}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 伴随文件（.hdr / .inf）
+# ---------------------------------------------------------------------------
+
+def test_companion_file_is_loaded_when_readable():
+    """.hdr 里常有人工填写的故障简报，报告模块（R-02）需要它。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = _standard_case(tmp, "companion")
+        rec.cfg.with_suffix(".hdr").write_text("故障简报：A相接地", encoding="utf-8")
+
+        recording, diags = try_load_recording(rec.cfg)
+
+    assert recording is not None
+    assert recording.meta.header_text == "故障简报：A相接地"
+    assert Code.COMPANION_UNREADABLE not in [d.code for d in diags]
+
+
+def test_unreadable_companion_file_is_reported_not_swallowed():
+    """回归：.hdr/.inf 读取失败曾经被静默吞掉。
+
+    静默的后果是"报告里少了故障简报"变成无法解释的现象，
+    而这两个文件恰恰承载人工结论。
+    """
+    from comtrade import reader as reader_mod
+
+    original = reader_mod.read_text
+
+    def boom(path, diagnostics):
+        raise OSError("模拟读取失败")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = _standard_case(tmp, "companion_bad")
+        rec.cfg.with_suffix(".hdr").write_text("故障简报：A相接地", encoding="utf-8")
+
+        reader_mod.read_text = boom
+        try:
+            recording, diags = try_load_recording(rec.cfg)
+        finally:
+            reader_mod.read_text = original
+
+    # 伴随文件读不到不影响解析本身
+    assert recording is not None
+    assert recording.meta.header_text is None
+
+    hits = [d for d in diags if d.code == Code.COMPANION_UNREADABLE]
+    assert hits, "伴随文件读取失败必须留痕"
+    assert hits[0].location == "companion_bad.hdr", hits[0].location

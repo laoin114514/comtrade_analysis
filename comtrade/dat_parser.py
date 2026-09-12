@@ -148,7 +148,7 @@ def _parse_ascii(
 
     if data is not None and data.ndim == 2 and data.shape[1] == expected_columns:
         diagnostics.info(
-            "DAT-OK",
+            Code.DAT_OK,
             f"ASCII 数据解析完成：{data.shape[0]} 个采样点 × {data.shape[1]} 列",
             location=dat_path.name,
         )
@@ -393,7 +393,7 @@ def _parse_binary(
         )
 
     diagnostics.info(
-        "DAT-OK",
+        Code.DAT_OK,
         f"{data_type.value} 数据解析完成：{arr.size} 个采样点，记录长度 {rec_size} 字节",
         location=dat_path.name,
     )
@@ -485,7 +485,7 @@ def _unpack_digital(
         padding = bits[:, digital_count:]
         if padding.any():
             diagnostics.info(
-                "DAT-DIG-PAD",
+                Code.DAT_DIGITAL_PADDING,
                 f"开关量打包的 {unused} 个未使用位中存在非 0 值，"
                 "通常无害，但若通道状态异常请检查开关量通道数是否正确",
                 location=location,

@@ -27,7 +27,18 @@ from pathlib import Path
 
 import numpy as np
 
-from .diagnostics import Diagnostic, Severity
+from .diagnostics import Code, Diagnostic, Severity
+
+#: 让整个结果判定为"不可信"的错误码 —— 都是数据完整性问题，
+#: 而不是可以容忍的元数据瑕疵（如单位未识别、变比缺失）。
+#: 用常量而非字面量：错误码一旦改名，这里必须跟着改，不能靠人记得。
+_UNRELIABLE_CODES = frozenset(
+    {
+        Code.DAT_SIZE_MISMATCH,  # 记录数与 cfg 声明不符：通道数/版本判定/文件截断
+        Code.DAT_RECORD_SHORT,  # 实际记录数明显少于声明值
+        Code.TIM_NOT_MONOTONIC,  # 时间轴非单调，按时间定位会整体错位
+    }
+)
 
 
 class ComtradeVersion(enum.IntEnum):
@@ -528,7 +539,7 @@ class Recording:
         """
         return not any(
             d.severity in (Severity.WARNING, Severity.FATAL)
-            and d.code.startswith(("DAT-002", "DAT-004", "TIM-001"))
+            and d.code in _UNRELIABLE_CODES
             for d in self.diagnostics
         )
 

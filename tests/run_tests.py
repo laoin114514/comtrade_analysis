@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 MODULES = (
     "tests.test_units_and_channels",
+    "tests.test_diagnostics",
     "tests.test_cfg",
     "tests.test_dat",
     "tests.test_convert",

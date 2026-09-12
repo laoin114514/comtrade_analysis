@@ -82,7 +82,7 @@ def build_time_axis(
         _cross_check(rate_axis, time_axis_from_ts, rate_tolerance, diagnostics, location)
 
     _check_monotonic(axis, diagnostics, location)
-    diagnostics.info("TIM-OK", f"时间轴已生成（依据：{origin}），时长 {axis[-1] - axis[0]:.6f} s")
+    diagnostics.info(Code.TIM_OK, f"时间轴已生成（依据：{origin}），时长 {axis[-1] - axis[0]:.6f} s")
     return axis
 
 
@@ -179,7 +179,7 @@ def _build_from_timestamps(
     if not np.any(timestamps):
         # 时标全为 0：字段存在但无意义，不能用来建时间轴
         diagnostics.info(
-            "TIM-TS-ZERO",
+            Code.TIM_TIMESTAMP_ZERO,
             "采样时标全为 0，未采用时标推算时间轴",
             location=location,
         )
@@ -191,7 +191,7 @@ def _build_from_timestamps(
         valid = ts != float(sentinel)
         if not valid.any():
             diagnostics.warn(
-                "TIM-TS-INVALID",
+                Code.TIM_TIMESTAMP_INVALID,
                 "所有采样时标均为缺失值哨兵，未采用时标推算时间轴",
                 location=location,
             )

@@ -62,6 +62,7 @@ comtrade_analysis/
 └── tests/
     ├── run_tests.py          轻量测试运行器（不依赖 pytest）
     ├── _util.py              测试辅助
+    ├── test_diagnostics.py   错误码登记完整性（守卫：码不得写死为字面量）
     ├── test_units_and_channels.py
     ├── test_cfg.py
     ├── test_dat.py
@@ -211,14 +212,17 @@ rec.unresolved_channels()                 # 需要人工映射的通道
 
 | 前缀 | 范围 | 示例 |
 |---|---|---|
-| `FIL-` | 文件层面 | `FIL-003` cfg/dat 未配对 |
-| `CFG-` | 配置解析 | `CFG-012` 日期二义性、`CFG-017` 比例系数 a 为 0 |
+| `FIL-` | 文件层面 | `FIL-003` cfg/dat 未配对、`FIL-008` 伴随文件读取失败 |
+| `CFG-` | 配置解析 | `CFG-012` 日期二义性、`CFG-017` 比例系数 a 为 0、`CFG-021` 数值字段无法解析 |
 | `DAT-` | 数据解析 | `DAT-002` 文件大小与声明不符、`DAT-009` 疑似已是工程量 |
-| `CHN-` | 通道识别 | `CHN-001` 角色无法识别、`CHN-004` 缺变比信息 |
+| `CHN-` | 通道识别 | `CHN-001` 角色无法识别、`CHN-004` 缺变比信息、`CHN-005` 一个角色被多个通道占用 |
 | `TIM-` | 时间轴 | `TIM-001` 时间轴非单调、`TIM-002` 采样率与采样时标不一致 |
 | `CHK-` | 结果自检 | `CHK-003` 三相电流不完整 |
+| `SYS-` | 兜底异常（不应出现，出现即缺陷） | `SYS-001` 未预期的错误 |
 
 完整错误码表见 `comtrade/diagnostics.py` 的 `Code` 类。**错误码一旦发布不应修改含义** —— 测试用例与界面提示都依赖它。
+
+界面层按码组织提示语时，请以 `Code` 类为唯一来源：**业务代码中不得把错误码写成字符串字面量**，一律引用 `Code.XXX` 常量。`tests/test_diagnostics.py` 有守卫测试，任何未登记的码字面量都会让测试失败。正常路径也会给出 INFO 级标记（`CFG-OK` / `DAT-OK` / `TIM-OK` / `CFG-ENC`），界面可用它们表示"已识别 / 已解析"。
 
 ---
 
@@ -303,7 +307,7 @@ FLOAT32 通常直接存工程量，cfg 里的 a/b 按惯例写 `a=1, b=0`。
 ### 运行测试
 
 ```bash
-python tests/run_tests.py          # 138 个测试，不需要 pytest
+python tests/run_tests.py          # 全量回归（当前 158 个用例），不需要 pytest
 python -m pytest tests             # 装了 pytest 也可以
 ```
 

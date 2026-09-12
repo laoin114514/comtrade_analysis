@@ -33,7 +33,7 @@ from .diagnostics import (
     ParseAbort,
     Severity,
 )
-from .encoding import sniff_is_text
+from .encoding import read_text, sniff_is_text
 from .models import Recording
 from .options import ParseOptions, DEFAULT_OPTIONS
 from .timebase import build_time_axis
@@ -155,14 +155,19 @@ def _load_companion_text(base: Path, extension: str, diagnostics: DiagnosticColl
     这两个文件可能含有人工填写的故障简报与线路信息，
     对报告模块（R-02 基础信息）有价值，且读取成本极低。
     """
-    from .encoding import read_text
-
     sibling = _find_sibling(base.with_suffix(extension), extension)
     if sibling is None:
         return None
     try:
         text = read_text(sibling, diagnostics)
-    except OSError:
+    except OSError as exc:
+        # 静默失败会让"报告里少了故障简报"变成无法解释的现象
+        diagnostics.info(
+            Code.COMPANION_UNREADABLE,
+            f"伴随文件 {sibling.name} 存在但读取失败（{exc}），"
+            "本次解析不包含该文件内容；报告中的故障简报等信息可能缺失",
+            location=sibling.name,
+        )
         return None
     return text.strip() or None
 
@@ -199,7 +204,8 @@ def load_recording(
         raise
     except Exception as exc:  # noqa: BLE001 - 兜底：任何未预期异常都转为可控错误
         diagnostics.fatal(
-            "SYS-001", f"解析过程中发生未预期的错误：{type(exc).__name__}: {exc}"
+            Code.SYS_UNEXPECTED_ERROR,
+            f"解析过程中发生未预期的错误：{type(exc).__name__}: {exc}",
         )
         raise ComtradeParseError(f"解析失败：{exc}", diagnostics.items) from exc
 
@@ -319,7 +325,7 @@ def _final_sanity_check(recording: Recording, diagnostics: DiagnosticCollector) 
         finite = values[np.isfinite(values)]
         if finite.size == 0:
             diagnostics.warn(
-                "CHK-001",
+                Code.CHK_CHANNEL_ALL_INVALID,
                 f"通道「{ch.name}」的全部采样点都无效（NaN），无法参与计算",
                 location=meta.source_dat.name if meta.source_dat else "",
             )
@@ -329,7 +335,7 @@ def _final_sanity_check(recording: Recording, diagnostics: DiagnosticCollector) 
         # 常值通道：多半是通道没用、或 a/b 有问题
         if finite.size > 1 and float(finite.max() - finite.min()) == 0.0:
             diagnostics.info(
-                "CHK-002",
+                Code.CHK_CHANNEL_CONSTANT,
                 f"通道「{ch.name}」的数值恒定（{finite[0]:g}），请确认该通道是否有实际接线",
                 location=meta.source_dat.name if meta.source_dat else "",
             )
@@ -355,14 +361,14 @@ def _hint_missing_three_phase(recording: Recording, diagnostics: DiagnosticColle
         missing = [r.value for r in roles if r not in present]
         if missing and found:
             diagnostics.info(
-                "CHK-003",
+                Code.CHK_THREE_PHASE_INCOMPLETE,
                 f"{label}不完整：已识别 {'/'.join(found)}，缺少 {'/'.join(missing)}；"
                 "依赖三相量的故障判据（如三相短路、两相短路）将无法执行",
                 location=recording.meta.source_cfg.name if recording.meta.source_cfg else "",
             )
         elif not found:
             diagnostics.info(
-                "CHK-004",
+                Code.CHK_THREE_PHASE_MISSING,
                 f"未识别到任何{label}通道，请确认通道命名或人工指定映射",
                 location=recording.meta.source_cfg.name if recording.meta.source_cfg else "",
             )

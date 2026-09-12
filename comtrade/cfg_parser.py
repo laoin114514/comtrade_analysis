@@ -372,7 +372,7 @@ def parse_cfg(
     )
 
     diagnostics.info(
-        "CFG-OK",
+        Code.CFG_OK,
         f"配置文件解析完成：COMTRADE {version.label}，"
         f"{len(analog_channels)} 个模拟量 / {len(digital_channels)} 个开关量",
         location=filename,

@@ -119,7 +119,7 @@ def decode_bytes(
                 and symbols <= len(high) * _SYMBOL_RATIO_LIMIT
             ):
                 diagnostics.info(
-                    "CFG-ENC",
+                    Code.CFG_ENCODING_FALLBACK,
                     "文件不是 UTF-8 编码，已按 cp1251（西里尔/俄文）解码",
                     location=location,
                 )
@@ -133,7 +133,7 @@ def decode_bytes(
     else:
         if not _looks_like_latin_mojibake(gb_text):
             diagnostics.info(
-                "CFG-ENC",
+                Code.CFG_ENCODING_FALLBACK,
                 "文件不是 UTF-8 编码，已按 gb18030 解码（常见于国内录波器的中文通道名）",
                 location=location,
             )
@@ -141,7 +141,7 @@ def decode_bytes(
 
     # --------------------------------------------------------- 4. Latin-1 兜底
     diagnostics.info(
-        "CFG-ENC",
+        Code.CFG_ENCODING_FALLBACK,
         "无法确定编码（非 UTF-8 / 非中文 / 非俄文），已按 latin-1 解码；"
         "若厂站名或通道名显示为乱码，请提供该文件的正确编码",
         location=location,
