@@ -79,6 +79,31 @@ def _parse_channel_count(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _read_numeric_field(
+    fields: list[str],
+    idx: int,
+    default: float,
+    label: str,
+    issues: list[str],
+) -> float:
+    """读取模拟通道行里的一个数值字段，解析失败时记入 ``issues`` 并返回默认值。
+
+    字段**整体缺失**（``idx`` 超出字段数）不在此处报 —— 那属于字段数异常，
+    已由 CFG-006 覆盖，重复报只会变成噪音。
+    """
+    if idx >= len(fields):
+        return default
+    text = fields[idx].strip()
+    if not text:
+        issues.append(f"{label}(空)")
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        issues.append(f"{label}={text[:12]}")
+        return default
+
+
 class _LineCursor:
     """按行推进的游标，自动跳过空行并保留原始行号用于诊断定位。"""
 
@@ -492,6 +517,8 @@ def _parse_analog_channels(
     对两种字段数都接受：现场存在版本年份与字段数不匹配的文件。
     """
     channels: list[AnalogChannel] = []
+    bad_numeric: list[tuple[str, list[str]]] = []
+    bad_numeric_loc: str | None = None
 
     for i in range(count):
         line_no, line = cursor.next(f"第 {i + 1} 个模拟量通道定义")
@@ -549,8 +576,12 @@ def _parse_analog_channels(
                 location=loc,
             )
 
-        a = _as_float(get_field(5), 1.0) or 0.0
-        b = _as_float(get_field(6), 0.0) or 0.0
+        # 数值字段：解析失败必须留痕。取默认值会让"坏掉的换算系数"变成
+        # 一个看起来正常的恒等映射，一路流进算法模块；min/max 取默认值则会
+        # 让取值范围校验（字节序与通道数错误的发现手段）被静默跳过。
+        numeric_issues: list[str] = []
+        a = _read_numeric_field(fields, 5, 1.0, "a", numeric_issues)
+        b = _read_numeric_field(fields, 6, 0.0, "b", numeric_issues)
         if a == 0.0:
             diagnostics.warn(
                 Code.CFG_SCALE_A_ZERO,
@@ -564,6 +595,15 @@ def _parse_analog_channels(
         ps_raw = get_field(12).upper() if n >= 13 else ""
         ps = ps_raw if ps_raw in ("P", "S") else None
 
+        skew_us = _read_numeric_field(fields, 7, 0.0, "skew", numeric_issues)
+        raw_min = _read_numeric_field(fields, 8, 0.0, "min", numeric_issues)
+        raw_max = _read_numeric_field(fields, 9, 0.0, "max", numeric_issues)
+
+        if numeric_issues:
+            bad_numeric.append((name, numeric_issues))
+            if bad_numeric_loc is None:
+                bad_numeric_loc = loc
+
         channels.append(
             AnalogChannel(
                 index=i,
@@ -574,15 +614,29 @@ def _parse_analog_channels(
                 unit_raw=unit_raw,
                 a=a,
                 b=b,
-                skew_us=_as_float(get_field(7), 0.0) or 0.0,
-                raw_min=_as_float(get_field(8), 0.0) or 0.0,
-                raw_max=_as_float(get_field(9), 0.0) or 0.0,
+                skew_us=skew_us,
+                raw_min=raw_min,
+                raw_max=raw_max,
                 primary=primary,
                 secondary=secondary,
                 ps=ps,
                 unit=unit_info.canonical,
                 role_confidence=0.0,
             )
+        )
+
+    if bad_numeric:
+        preview = "、".join(
+            f"{ch_name}[{'/'.join(issues)}]" for ch_name, issues in bad_numeric[:6]
+        )
+        diagnostics.warn(
+            Code.CFG_NUMERIC_FIELD_INVALID,
+            f"有 {len(bad_numeric)} 个通道的数值字段为空或无法解析，已按默认值处理："
+            + preview
+            + ("…" if len(bad_numeric) > 6 else "")
+            + "。比例系数 a/b 不可用会让该通道按恒等映射输出（数值看似正常但不可用）；"
+            "min/max 不可用会让该通道的取值范围校验被跳过",
+            location=bad_numeric_loc or cursor.location(),
         )
 
     return channels

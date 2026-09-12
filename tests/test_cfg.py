@@ -340,3 +340,55 @@ def test_extra_trailing_lines_are_ignored():
     with tempfile.TemporaryDirectory() as td:
         parsed, _ = _parse_cfg_text(Path(td), text)
         assert len(parsed.analog_channels) == 1
+
+
+# ---------------------------------------------------------------------------
+# 数值字段的解析失败必须留痕（CFG-021）
+# ---------------------------------------------------------------------------
+
+def test_unparsable_numeric_fields_are_reported():
+    """a/b/skew/min/max 解析失败不能静默取默认值。
+
+    取默认值的后果：a 变成 1.0 后该通道按恒等映射输出（数值看似正常但不可用，
+    会一路流进算法模块）；min/max 变成 0 后该通道的取值范围校验被静默跳过，
+    而那是字节序错误、通道数量错误的主要发现手段。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        text = render_cfg(CfgSpec(version=1999, analog=[AnalogDef(name="Ia")]))
+        bad = text.replace(",A,1,0,0,-32767,32767,", ",A,abc,xyz,0,oops,nope,")
+        assert ",A,abc,xyz,0,oops,nope," in bad, "测试数据未按预期改写"
+
+        parsed, diag = _parse_cfg_text(tmp, bad)
+
+    # 容错：仍然产出通道，按默认值继续
+    ch = parsed.analog_channels[0]
+    assert ch.a == 1.0 and ch.b == 0.0
+    assert ch.raw_min == 0.0 and ch.raw_max == 0.0
+
+    hits = [d for d in diag if d.code == Code.CFG_NUMERIC_FIELD_INVALID]
+    assert hits, "数值字段解析失败必须留痕，不能静默"
+    message = hits[0].message
+    assert "Ia" in message
+    for label in ("a=", "b=", "min=", "max="):
+        assert label in message, f"诊断应指出具体字段：{message}"
+
+
+def test_numeric_field_diagnostic_is_aggregated_and_absent_when_clean():
+    """正常文件不应出现 CFG-021；多通道异常只报一条（不逐通道刷屏）。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        for version in (None, 1991, 1999, 2013):
+            _, diag = _parse_cfg_text(tmp, render_cfg(CfgSpec(version=version)))
+            assert Code.CFG_NUMERIC_FIELD_INVALID not in diag.codes(), version
+
+        text = render_cfg(CfgSpec(
+            version=1999,
+            analog=[AnalogDef(name=f"CH{i}") for i in range(4)],
+        ))
+        text = text.replace(",A,1,0,0,-32767,32767,", ",A,abc,0,0,-32767,32767,")
+        _, diag = _parse_cfg_text(tmp, text)
+
+    hits = [d for d in diag if d.code == Code.CFG_NUMERIC_FIELD_INVALID]
+    assert len(hits) == 1, "一个根因只应报一条"
+    assert "4 个通道" in hits[0].message

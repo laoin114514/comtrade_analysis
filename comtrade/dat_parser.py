@@ -152,7 +152,14 @@ def _parse_ascii(
             f"ASCII 数据解析完成：{data.shape[0]} 个采样点 × {data.shape[1]} 列",
             location=dat_path.name,
         )
-        return _assemble_ascii(data, analog_count, digital_count, declared_count, diagnostics)
+        return _assemble_ascii(
+            data,
+            analog_count,
+            digital_count,
+            declared_count,
+            diagnostics,
+            location=dat_path.name,
+        )
 
     if data is not None and data.ndim == 2 and data.shape[1] != expected_columns:
         diagnostics.warn(
@@ -248,7 +255,14 @@ def _parse_ascii_tolerant(
         raise ParseAbort("dat 无可解析内容")
 
     data = np.asarray(rows, dtype=np.float64)
-    return _assemble_ascii(data, analog_count, digital_count, declared_count, diagnostics)
+    return _assemble_ascii(
+        data,
+        analog_count,
+        digital_count,
+        declared_count,
+        diagnostics,
+        location=dat_path.name,
+    )
 
 
 def _assemble_ascii(
@@ -257,6 +271,8 @@ def _assemble_ascii(
     digital_count: int,
     declared_count: int,
     diagnostics: DiagnosticCollector,
+    *,
+    location: str = "",
 ) -> ParsedDat:
     """把 ASCII 二维数组拆成采样号、时标、模拟量矩阵、开关量矩阵。"""
     n = data.shape[0]
@@ -264,7 +280,7 @@ def _assemble_ascii(
 
     sample_numbers = data[:, 0].astype(np.int64)
     _check_record_count(
-        n, declared_count, int(sample_numbers[0]) if n else None, diagnostics, ""
+        n, declared_count, int(sample_numbers[0]) if n else None, diagnostics, location
     )
     timestamps = data[:, 1].astype(np.int64)
 

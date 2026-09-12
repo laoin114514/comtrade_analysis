@@ -30,6 +30,30 @@ class AsciiScaling(str, enum.Enum):
     """不施加 a/b 换算。仅在确认客户文件写的是工程量时使用。"""
 
 
+#: ``time_axis_source`` 的合法取值
+TIME_AXIS_SOURCES = ("rates", "timestamps")
+"""时间轴优先依据：采样率分段 / 采样点时标。见 :attr:`ParseOptions.time_axis_source`。"""
+
+
+def _coerce_ascii_scaling(value: object) -> AsciiScaling:
+    """把字符串取值归一化为枚举。
+
+    ``AsciiScaling`` 是 str 混入枚举，``AsciiScaling.NEVER == "never"`` 为真，
+    但 ``"never" is AsciiScaling.NEVER`` 为假。命令行、配置文件、界面层传进来的
+    都是字符串，若不在入口归一化，下面的 ``is`` 判断会静默失效 ——
+    表现为 ``--ascii-scaling never`` 完全不生效（实测过）。
+    """
+    if isinstance(value, AsciiScaling):
+        return value
+    try:
+        return AsciiScaling(value)  # type: ignore[arg-type]
+    except ValueError as exc:
+        raise ValueError(
+            f"ascii_scaling 取值非法：{value!r}，"
+            f"可选 {' / '.join(a.value for a in AsciiScaling)}"
+        ) from exc
+
+
 @dataclass(slots=True)
 class ParseOptions:
     """解析选项。默认值适用于绝大多数标准合规文件。"""
@@ -47,7 +71,10 @@ class ParseOptions:
 
     # -------------------------------------------------------------- 换算策略
     ascii_scaling: AsciiScaling = AsciiScaling.ALWAYS
-    """ASCII 数据的 a/b 换算策略，见 :class:`AsciiScaling`。"""
+    """ASCII 数据的 a/b 换算策略，见 :class:`AsciiScaling`。
+
+    允许直接传字符串 ``"always"`` / ``"never"``：构造时自动归一化为枚举。
+    """
 
     prescaled_span_ratio: float = 0.05
     """跨度提示的阈值（**纯提示，不改变解析行为**）。
@@ -108,6 +135,22 @@ class ParseOptions:
     默认关闭 —— 现场文件偶有声明错误，按实际通道行解析更稳妥。
     """
 
+    def __post_init__(self) -> None:
+        """入口处归一化并由校验选项取值。
+
+        这些字段都允许以字符串进入（命令行 / 配置文件 / 界面层），
+        统一在此归一化，避免下游用枚举身份判断时被静默绕过。
+        """
+        self.ascii_scaling = _coerce_ascii_scaling(self.ascii_scaling)
+
+        # 写错的取值不能静默退回默认行为：上游以为换了依据、实际没换，
+        # 会表现为"同一份录波在两处算出不同时长"这类难查的问题。
+        if self.time_axis_source not in TIME_AXIS_SOURCES:
+            raise ValueError(
+                f"time_axis_source 取值非法：{self.time_axis_source!r}，"
+                f"可选 {' / '.join(TIME_AXIS_SOURCES)}"
+            )
+
     def resolved_value_dtype(self):
         import numpy as np
 
@@ -117,4 +160,9 @@ class ParseOptions:
 DEFAULT_OPTIONS = ParseOptions()
 
 
-__all__ = ["AsciiScaling", "ParseOptions", "DEFAULT_OPTIONS"]
+__all__ = [
+    "AsciiScaling",
+    "ParseOptions",
+    "DEFAULT_OPTIONS",
+    "TIME_AXIS_SOURCES",
+]

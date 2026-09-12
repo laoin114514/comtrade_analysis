@@ -29,7 +29,9 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from .models import ChannelRole, Quantity
+from .diagnostics import Code, DiagnosticCollector
+from .models import AnalogChannel, ChannelRole, Quantity
+from .units import parse_unit
 
 # ---------------------------------------------------------------------------
 # 名称归一化
@@ -303,18 +305,18 @@ def _compose_role(quantity: Quantity, phase: str) -> ChannelRole | None:
     return None
 
 
-def identify_all(channels, diagnostics, location: str = "") -> None:
+def identify_all(
+    channels: list[AnalogChannel],
+    diagnostics: DiagnosticCollector,
+    location: str = "",
+) -> None:
     """对一批模拟通道就地执行角色识别，并汇总诊断。
 
     识别失败的通道统一记录一条 CHN-001，界面据此提示用户手工映射。
     """
-    from .diagnostics import Code
-
     unresolved: list[str] = []
 
     for ch in channels:
-        from .units import parse_unit
-
         unit_info = parse_unit(ch.unit_raw)
         result = identify(ch.name, ch.phase_raw, unit_info.kind)
         ch.role = result.role
@@ -373,10 +375,12 @@ def _warn_duplicate_roles(channels, diagnostics, location: str) -> None:
     )
 
 
-def _warn_duplicate_names(channels, diagnostics, location: str) -> None:
+def _warn_duplicate_names(
+    channels: list[AnalogChannel],
+    diagnostics: DiagnosticCollector,
+    location: str,
+) -> None:
     """检测重名通道 —— 名称不能作为唯一键。"""
-    from .diagnostics import Code
-
     seen: dict[str, int] = {}
     for ch in channels:
         seen[ch.name] = seen.get(ch.name, 0) + 1

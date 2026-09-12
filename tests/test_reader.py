@@ -288,3 +288,43 @@ def test_garbage_dat_content_does_not_crash():
         # 能读出数据（内容无意义），但必须留下诊断痕迹
         assert recording is not None
         assert any(d.code == Code.DAT_SIZE_MISMATCH for d in diags)
+
+
+# ---------------------------------------------------------------------------
+# 命令行入口
+# ---------------------------------------------------------------------------
+
+def test_cli_ascii_scaling_never_takes_effect():
+    """回归：``--ascii-scaling never`` 曾经完全不生效。
+
+    根因是命令行把字符串传进 ``ParseOptions``，而 ``AsciiScaling`` 作为
+    str 混入枚举与原成员 ``is`` 不相等，判定被静默绕过。
+    这里走完整的命令行路径 —— 只看 API 层会漏掉这类"接线"错误。
+    """
+    import io
+    import json
+    from contextlib import redirect_stdout
+
+    from comtrade.__main__ import main
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = TempRecording(tmp, "cli")
+        rec.write_cfg(CfgSpec(
+            analog=[AnalogDef(name="Ia", phase="A", unit="A", a=0.5, b=0.0, ps="P")],
+            digital=[],
+            data_type="ASCII",
+            segments=[(4000.0, 10)],
+        ))
+        rec.write_ascii(np.ones((1, 10)) * 100.0, None)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main([str(rec.cfg), "--json", "--ascii-scaling", "never"])
+        payload = json.loads(buf.getvalue())
+
+    assert code == 0
+    codes = [d["code"] for d in payload["diagnostics"]]
+    assert Code.DAT_SCALING_DISABLED in codes, (
+        f"--ascii-scaling never 未生效（若是 a/b 换算被照常施加，说明选项被忽略）。诊断：{codes}"
+    )

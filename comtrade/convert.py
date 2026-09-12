@@ -43,16 +43,35 @@ from .units import parse_unit
 #: 用于防止 1991 版二进制把 -1 当哨兵、而该文件恰好大量出现 -1 的误伤。
 MAX_MISSING_FRACTION = 0.2
 
-#: 绝对数量下限：出现次数不超过该值时不看占比，直接屏蔽。
-#: 录制点很少（如测试文件）时占比没有统计意义；
+#: 绝对数量下限：样本量不足时，出现次数不超过该值即按缺失值屏蔽。
 #: 而在正常规模的录波里，一个值只出现几次，也不可能是"正常数据值"。
 MIN_MISSING_ABSOLUTE = 8
+
+#: 占比守卫的启用门槛（样本点数）。
+#: 样本量低于该值时占比没有统计意义（3 个点里有 1 个哨兵就是 33%），
+#: 此时只按 ``MIN_MISSING_ABSOLUTE`` 判断；达到门槛后占比守卫无条件生效。
+#:
+#: 早先的实现把两条判据写成"或"（次数少 **或** 占比低即屏蔽），
+#: 等于让绝对次数规则覆盖了占比守卫 —— 16~39 点的短录波里，
+#: 即使一半数值都等于哨兵（很像真实数据）也会被整片抹成 NaN。
+MIN_SAMPLES_FOR_FRACTION = 16
 
 #: 判定依据标签
 _R_A_ZERO = "a_zero"
 _R_SCALED = "scaled"
 _R_IDENTITY = "identity"
 _R_NEVER = "never"
+
+
+def looks_like_missing_value(count: int, fraction: float, size: int) -> bool:
+    """判断"等于候选哨兵"的采样点该按缺失值屏蔽，还是视为正常数据。
+
+    样本量足够时以占比为准；样本量不足时占比没有统计意义，只看出现次数。
+    两条判据的适用边界是显式的 —— 见 ``MIN_SAMPLES_FOR_FRACTION`` 的说明。
+    """
+    if size >= MIN_SAMPLES_FOR_FRACTION:
+        return fraction <= MAX_MISSING_FRACTION
+    return count <= MIN_MISSING_ABSOLUTE
 
 
 def missing_sentinel(data_type: DataFileType, version: ComtradeVersion) -> float | None:
@@ -97,6 +116,7 @@ def convert_analog_channels(
     # 按文件聚合的判定结果：一个根因只报一条诊断
     prescaled: list[str] = []
     scale_skipped: list[str] = []
+    never_skipped: list[str] = []
     float32_nonidentity: list[str] = []
     missing_hits: list[tuple[str, int]] = []
     out_of_range: list[tuple[str, int]] = []
@@ -120,7 +140,7 @@ def convert_analog_channels(
             count = int(hit.sum())
             if count:
                 fraction = count / raw.size
-                if count <= MIN_MISSING_ABSOLUTE or fraction <= MAX_MISSING_FRACTION:
+                if looks_like_missing_value(count, fraction, raw.size):
                     invalid |= hit
                     missing_hits.append((ch.name, count))
                 else:
@@ -147,7 +167,7 @@ def convert_analog_channels(
         if reason == _R_A_ZERO:
             scale_skipped.append(ch.name)
         elif reason == _R_NEVER:
-            prescaled.append(ch.name)
+            never_skipped.append(ch.name)
         # 提示：只在"确实施加了换算"的前提下，提示"若文件其实已换算则应改用 never"
         if apply_scale and _prescaled_suspicion(ch, raw, data_type, options):
             prescaled.append(ch.name)
@@ -183,7 +203,7 @@ def convert_analog_channels(
 
     # ------------------------------------------------------------ 汇总诊断
     _report(diagnostics, location, missing_hits, out_of_range,
-            prescaled, scale_skipped, float32_nonidentity)
+            prescaled, scale_skipped, never_skipped, float32_nonidentity)
 
 
 def _report(
@@ -193,6 +213,7 @@ def _report(
     out_of_range: list[tuple[str, int]],
     prescaled: list[str],
     scale_skipped: list[str],
+    never_skipped: list[str],
     float32_nonidentity: list[str],
 ) -> None:
     """把逐通道的判定结果聚合成按文件维度的诊断。"""
@@ -246,6 +267,18 @@ def _report(
             location=location,
         )
 
+    if never_skipped:
+        # 使用者显式要求跳过，属预期行为，给 INFO —— 但必须能看见是哪几个通道，
+        # 否则"选项有没有生效"无从确认（DAT-009 的提示语在这条路径上不适用）。
+        diagnostics.info(
+            Code.DAT_SCALING_DISABLED,
+            f"按 ascii_scaling=never 跳过 a/b 换算的 {len(never_skipped)} 个通道"
+            "（数值为文件中的原始值，未经比例系数换算）："
+            + "、".join(never_skipped[:8])
+            + ("…" if len(never_skipped) > 8 else ""),
+            location=location,
+        )
+
 
 def _decide_scaling(
     ch: AnalogChannel,
@@ -259,6 +292,9 @@ def _decide_scaling(
     """
     if ch.a == 0.0:
         return False, _R_A_ZERO
+    # 这里用身份比较是安全的：ParseOptions.__post_init__ 已把字符串取值
+    # 归一化成枚举成员。若绕过该入口直接构造对象，务必先归一化 ——
+    # AsciiScaling 是 str 混入枚举，字符串与原成员 `is` 不相等。
     if options.ascii_scaling is AsciiScaling.NEVER:
         return False, _R_NEVER
     if ch.a == 1.0 and ch.b == 0.0:
@@ -342,4 +378,11 @@ def _apply_ratio(
     ch.ratio_applied = True
 
 
-__all__ = ["missing_sentinel", "convert_analog_channels", "MAX_MISSING_FRACTION"]
+__all__ = [
+    "missing_sentinel",
+    "looks_like_missing_value",
+    "convert_analog_channels",
+    "MAX_MISSING_FRACTION",
+    "MIN_MISSING_ABSOLUTE",
+    "MIN_SAMPLES_FOR_FRACTION",
+]

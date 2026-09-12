@@ -237,3 +237,35 @@ def test_empty_dat_is_fatal():
             else:
                 raise AssertionError("空 dat 应当中断")
             assert Code.DAT_EMPTY in diag.codes()
+
+
+# ---------------------------------------------------------------------------
+# 诊断定位信息
+# ---------------------------------------------------------------------------
+
+def test_ascii_record_count_mismatch_carries_location():
+    """回归：ASCII 路径的 DAT-002/DAT-004 曾经丢失文件名。
+
+    记录数不符是最有价值的诊断之一，它的价值就在于指出"哪个文件对不上"；
+    没有定位信息等于废掉一半，而 ASCII 恰恰是最容易被手工编辑或截断的格式。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _, diag = _parse(tmp, np.ones((1, 3)), None, data_type="ASCII", declared=10)
+
+        hits = [d for d in diag if d.code == Code.DAT_SIZE_MISMATCH]
+        assert hits, "记录数明显不符应当报警"
+        assert hits[0].location == "t.dat", f"定位信息缺失：{hits[0].location!r}"
+
+        short = [d for d in diag if d.code == Code.DAT_RECORD_SHORT]
+        assert short and short[0].location == "t.dat"
+
+
+def test_binary_record_count_mismatch_carries_location():
+    """二进制路径同时校验，防止两边行为再次分叉。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _, diag = _parse(tmp, np.ones((1, 3)), None, data_type="BINARY", declared=10)
+
+        hits = [d for d in diag if d.code == Code.DAT_SIZE_MISMATCH]
+        assert hits and hits[0].location == "t.dat"

@@ -276,3 +276,115 @@ def test_float32_nonidentity_scaling_is_reported_as_info():
     hits = [d for d in diag if d.code == Code.DAT_FLOAT32_SCALED]
     assert hits and hits[0].severity is Severity.INFO
     np.testing.assert_allclose(ch.values, [0.015, 0.025, 0.035])
+
+
+# ---------------------------------------------------------------------------
+# 解析选项取值（回归：字符串形式曾被静默忽略）
+# ---------------------------------------------------------------------------
+
+def test_ascii_scaling_accepts_plain_string():
+    """命令行与配置文件传进来的是字符串，必须与枚举完全等价。
+
+    回归：``AsciiScaling`` 是 str 混入枚举，``"never" is AsciiScaling.NEVER``
+    为假，而命令行传的正是字符串 —— 修复前 ``--ascii-scaling never``
+    被静默忽略，开关看起来存在但完全不生效。
+    """
+    assert ParseOptions(ascii_scaling="never").ascii_scaling is AsciiScaling.NEVER
+    assert ParseOptions(ascii_scaling="always").ascii_scaling is AsciiScaling.ALWAYS
+
+    raw = np.array([[1.0, 2.0]])
+    for value in (AsciiScaling.NEVER, "never"):
+        ch = _channel(a=10.0, b=0.0)
+        _run([ch], raw, data_type=DataFileType.ASCII,
+             options=ParseOptions(ascii_scaling=value))
+        np.testing.assert_allclose(ch.values, [1.0, 2.0])
+        assert ch.scaling_applied is False
+
+    for value in (AsciiScaling.ALWAYS, "always"):
+        ch = _channel(a=10.0, b=0.0)
+        _run([ch], raw, data_type=DataFileType.ASCII,
+             options=ParseOptions(ascii_scaling=value))
+        np.testing.assert_allclose(ch.values, [10.0, 20.0])
+
+
+def test_invalid_option_values_are_rejected():
+    """写错的取值必须报错，不能静默退回默认行为。
+
+    静默退回的后果是"上游以为换了依据、实际没换"，
+    表现为同一份录波两处算出不同时长这类难查的问题。
+    """
+    for bad in ("alway", "", None, "NEVER1"):
+        try:
+            ParseOptions(ascii_scaling=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"ascii_scaling={bad!r} 应当被拒绝")
+
+    try:
+        ParseOptions(time_axis_source="timestamp")  # 少一个 s
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("非法的 time_axis_source 应当被拒绝")
+
+    assert ParseOptions(time_axis_source="timestamps").time_axis_source == "timestamps"
+
+
+def test_never_scaling_reports_which_channels_were_skipped():
+    """显式跳过换算时必须能看见影响范围，否则无从确认选项是否生效。
+
+    同时这条路径不应再给 DAT-009 —— 那句提示说"已按标准施加换算、建议改用
+    never"，在已经设成 never 时自相矛盾。
+    """
+    raw = np.array([[1.0, 2.0]])
+    ch = _channel(a=10.0, b=0.0)
+    diag = _run([ch], raw, data_type=DataFileType.ASCII,
+                options=ParseOptions(ascii_scaling="never"))
+    hits = [d for d in diag if d.code == Code.DAT_SCALING_DISABLED]
+    assert hits, "跳过换算的通道必须列出"
+    assert "Ia" in hits[0].message
+    assert Code.DAT_ASCII_PRESCALED not in diag.codes()
+
+
+# ---------------------------------------------------------------------------
+# 缺失值占比守卫的适用边界
+# ---------------------------------------------------------------------------
+
+def test_sentinel_fraction_guard_applies_to_short_records():
+    """短录波里"占比过高"不能被绝对次数规则覆盖。
+
+    回归：早先的判据是"次数少 **或** 占比低即屏蔽"，等于让绝对次数规则
+    压过了占比守卫 —— 16~39 点的录波即使一半数值等于哨兵（很像真实数据）
+    也会被整片抹成 NaN，整通道变成"全部采样点无效"。
+    """
+    # 16 点里 8 个等于 1991 版哨兵 -1（占 50%）—— 判为正常数据，不屏蔽
+    raw = np.zeros((1, 16))
+    raw[0, :8] = -1.0
+    ch = _channel()
+    diag = _run([ch], raw, version=ComtradeVersion.V1991)
+    assert ch.invalid_mask is None
+    assert Code.DAT_MISSING_VALUE in diag.codes()
+
+    # 同一占比放在长录波里结论一致
+    raw = np.zeros((1, 1600))
+    raw[0, :800] = -1.0
+    ch = _channel()
+    _run([ch], raw, version=ComtradeVersion.V1991)
+    assert ch.invalid_mask is None
+
+    # "少量出现"仍照常屏蔽 —— 守卫没有把功能一起关掉
+    raw = np.zeros((1, 1600))
+    raw[0, [5, 500]] = -1.0
+    ch = _channel()
+    _run([ch], raw, version=ComtradeVersion.V1991)
+    assert ch.invalid_count == 2
+
+
+def test_short_record_still_masks_when_sentinel_is_rare():
+    """样本量不足时按出现次数判断：短录波里的个别哨兵照样屏蔽。"""
+    raw = np.array([[100.0, -32768.0, 300.0]])
+    ch = _channel()
+    diag = _run([ch], raw)
+    assert ch.invalid_count == 1
+    assert Code.DAT_MISSING_VALUE in diag.codes()

@@ -1,7 +1,8 @@
 """用真实 COMTRADE 样本库验证解析器。
 
 项目自身没有客户样例，因此用公开样本库（如 fault-wave-analyzer 的
-``fastapi/tests/fixtures/sample_library/``，13 个来自 GitHub MIT 仓库的样例）
+``fastapi/tests/fixtures/sample_library/``，12 组来自 GitHub MIT 仓库的样例，
+其中 1 组只有 cfg 无 dat，见 README「实测结果」一节）
 做兼容性回归。本工具不硬编码任何样本库路径，由参数指定。
 
 用法::
