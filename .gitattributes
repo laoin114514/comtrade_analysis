@@ -1,0 +1,10 @@
+# 统一换行符，保证跨机器 checkout 后文件字节一致
+# （回归测试依赖样例文件与生成器输出逐字节相同，不能让 Git 自动转换 CRLF）
+* text=auto eol=lf
+
+# 样例数据文件不做任何换行符/编码转换：
+# .dat 既有二进制也有 ASCII，混在一起，统一按二进制处理最稳妥
+*.dat binary
+*.hdr binary
+*.inf binary
+*.cff binary

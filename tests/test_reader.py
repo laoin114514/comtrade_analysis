@@ -1,0 +1,290 @@
+"""主入口测试：文件配对、完整性检查、非法文件处理、端到端。"""
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+from comtrade import ChannelRole, ComtradeParseError, ComtradeVersion, load_recording, try_load_recording
+from comtrade.diagnostics import Code
+from comtrade.reader import resolve_pair
+
+from tests._util import AnalogDef, CfgSpec, DigitalDef, TempRecording, simple_sine
+
+
+def _standard_case(tmp: Path, name="case", *, version=1999, data_type="BINARY",
+                   extra_tail=(), segments=((4000.0, 400),)):
+    """构造一份内容正确的录波：Ia/Ib/Ic/Ua/Ub/Uc + 2 个开关量。"""
+    rec = TempRecording(tmp, name)
+    spec = CfgSpec(
+        version=version,
+        analog=[
+            AnalogDef(name="Ia", phase="A", unit="A"),
+            AnalogDef(name="Ib", phase="B", unit="A"),
+            AnalogDef(name="Ic", phase="C", unit="A"),
+            AnalogDef(name="Ua", phase="A", unit="V", primary=110000.0, secondary=100.0),
+            AnalogDef(name="Ub", phase="B", unit="V", primary=110000.0, secondary=100.0),
+            AnalogDef(name="Uc", phase="C", unit="V", primary=110000.0, secondary=100.0),
+        ],
+        digital=[DigitalDef(name="TRIP"), DigitalDef(name="52a")],
+        data_type=data_type,
+        segments=[(r, e) for r, e in segments],
+        tail_lines=list(extra_tail),
+    )
+    rec.write_cfg(spec)
+
+    n = segments[-1][1]
+    analog = np.vstack([simple_sine(n=n, amplitude=1000.0, phase=i * 1.0) for i in range(6)])
+    digital = np.zeros((2, n), dtype=bool)
+    digital[0, n // 2:] = True
+    if data_type == "ASCII":
+        rec.write_ascii(analog, digital)
+    else:
+        rec.write_binary(analog, digital, data_type=data_type)
+    return rec
+
+
+# ---------------------------------------------------------------------------
+# 文件配对（F-03）
+# ---------------------------------------------------------------------------
+
+def test_pair_resolution_from_cfg_and_dat():
+    with tempfile.TemporaryDirectory() as td:
+        rec = _standard_case(Path(td))
+        cfg, dat = resolve_pair(rec.cfg, __import__("comtrade").DiagnosticCollector())
+        assert cfg == rec.cfg and dat == rec.dat
+
+        cfg2, dat2 = resolve_pair(rec.dat, __import__("comtrade").DiagnosticCollector())
+        assert cfg2 == rec.cfg and dat2 == rec.dat
+
+
+def test_pair_resolution_is_case_insensitive():
+    """扩展名大小写不一致（.CFG/.DAT）也必须能配对。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = TempRecording(tmp, "up")
+        rec.write_cfg(CfgSpec(version=1999))
+        rec.write_binary(np.zeros((1, 10), dtype=np.int32), np.zeros((1, 10), dtype=bool))
+        upper_cfg = tmp / "up.CFG"
+        rec.cfg.rename(upper_cfg)
+        cfg, dat = resolve_pair(upper_cfg, __import__("comtrade").DiagnosticCollector())
+        assert cfg == upper_cfg and dat == rec.dat
+
+
+def test_missing_pair_is_fatal():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = TempRecording(tmp, "lonely")
+        rec.write_cfg(CfgSpec(version=1999))
+        recording, diags = try_load_recording(rec.cfg)
+        assert recording is None
+        assert any(d.code == Code.PAIR_MISSING for d in diags)
+
+
+def test_missing_file_is_fatal():
+    recording, diags = try_load_recording("C:/不存在的路径/nothing.cfg")
+    assert recording is None
+    assert any(d.code == Code.FILE_NOT_FOUND for d in diags)
+
+
+def test_unsupported_extension_is_rejected():
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "x.txt"
+        path.write_text("hello", encoding="utf-8")
+        recording, diags = try_load_recording(path)
+        assert recording is None
+        assert any(d.code == Code.UNSUPPORTED_EXTENSION for d in diags)
+
+
+def test_cff_is_reported_as_unsupported():
+    """2013 版单文件格式本期不支持，必须给出明确提示而不是莫名崩溃。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "x.cff"
+        path.write_text("[CFG]\n...", encoding="utf-8")
+        recording, diags = try_load_recording(path)
+        assert recording is None
+        assert any(d.code == Code.CFF_NOT_SUPPORTED for d in diags)
+
+
+def test_empty_file_is_rejected():
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "empty.cfg"
+        path.write_bytes(b"")
+        recording, diags = try_load_recording(path)
+        assert recording is None
+        assert any(d.code == Code.FILE_EMPTY for d in diags)
+
+
+def test_cfg_dat_swapped_is_detected():
+    """把 cfg 和 dat 的内容传反了 —— 应检测出来并提示，而不是抛未处理异常。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = _standard_case(tmp, "swap")
+        cfg_bytes = rec.cfg.read_bytes()
+        dat_bytes = rec.dat.read_bytes()
+        rec.cfg.write_bytes(dat_bytes)
+        rec.dat.write_bytes(cfg_bytes)
+        recording, diags = try_load_recording(rec.cfg)
+        assert recording is None
+        assert any(
+            d.code in (Code.FILE_LOOKS_BINARY, Code.CFG_HEADER_UNPARSABLE,
+                       Code.CFG_CHANNEL_COUNT_LINE, Code.CFG_UNEXPECTED_END,
+                       Code.CFG_DATA_TYPE_UNKNOWN, "SYS-001")
+            for d in diags
+        )
+
+
+# ---------------------------------------------------------------------------
+# 端到端
+# ---------------------------------------------------------------------------
+
+def test_end_to_end_binary():
+    with tempfile.TemporaryDirectory() as td:
+        rec = _standard_case(Path(td))
+        recording = load_recording(rec.cfg)
+
+        assert recording.meta.version is ComtradeVersion.V1999
+        assert recording.meta.station_name == "TEST-STATION"
+        assert recording.sample_count == 400
+        assert recording.duration > 0
+        assert recording.meta.cfg_sha256 and recording.meta.dat_sha256
+
+        roles = recording.by_role_map()
+        for role in (ChannelRole.IA, ChannelRole.IB, ChannelRole.IC,
+                     ChannelRole.UA, ChannelRole.UB, ChannelRole.UC):
+            assert role in roles, role
+
+        ia = recording.require_role(ChannelRole.IA)
+        assert ia.values.shape == (400,)
+        assert np.all(np.isfinite(ia.values))
+        assert ia.unit == "A"
+
+
+def test_end_to_end_all_data_types():
+    for dtype in ("ASCII", "BINARY", "BINARY32", "FLOAT32"):
+        with tempfile.TemporaryDirectory() as td:
+            rec = _standard_case(Path(td), name=f"c_{dtype}", data_type=dtype)
+            recording = load_recording(rec.cfg)
+            assert recording.meta.data_type.value == dtype
+            assert recording.sample_count == 400
+            assert recording.require_role(ChannelRole.IA).values.shape == (400,)
+
+
+def test_end_to_end_1991_and_2013():
+    for version, tail in ((1991, ()), (2013, ("8h00,8h00", "B,0"))):
+        with tempfile.TemporaryDirectory() as td:
+            rec = _standard_case(Path(td), name=f"v{version}", version=version, extra_tail=tail)
+            recording = load_recording(rec.cfg)
+            assert recording.meta.version is ComtradeVersion(version)
+            assert recording.sample_count == 400
+
+
+def test_digital_channels_and_transitions():
+    with tempfile.TemporaryDirectory() as td:
+        rec = _standard_case(Path(td))
+        recording = load_recording(rec.cfg)
+        trip = recording.digital_channels[0]
+        assert trip.values.dtype == bool
+        assert trip.transitions().tolist() == [200]
+        assert recording.digital_channels[1].transitions().tolist() == []
+
+
+def test_time_axis_matches_declared_rate():
+    with tempfile.TemporaryDirectory() as td:
+        rec = _standard_case(Path(td))
+        recording = load_recording(rec.cfg)
+        assert abs(recording.duration - 399 / 4000.0) < 1e-9
+        assert np.all(np.diff(recording.time_axis) > 0)
+
+
+# ---------------------------------------------------------------------------
+# 结果查询接口
+# ---------------------------------------------------------------------------
+
+def test_by_role_helpers():
+    with tempfile.TemporaryDirectory() as td:
+        rec = _standard_case(Path(td))
+        recording = load_recording(rec.cfg)
+
+        assert len(recording.by_role(ChannelRole.IA, ChannelRole.IB)) == 2
+        assert recording.first_by_role(ChannelRole.UC) is not None
+        assert recording.first_by_role(ChannelRole.I0) is None
+
+        try:
+            recording.require_role(ChannelRole.I0)
+        except KeyError as exc:
+            assert "I0" in str(exc)
+        else:
+            raise AssertionError("缺失角色应当抛 KeyError")
+
+
+def test_index_range_by_time():
+    with tempfile.TemporaryDirectory() as td:
+        rec = _standard_case(Path(td))
+        recording = load_recording(rec.cfg)
+        start, end = recording.index_range(0.0, 0.0005)
+        assert start == 0
+        assert end == 3  # 0, 0.00025, 0.0005 三个点
+
+
+def test_summary_is_renderable():
+    with tempfile.TemporaryDirectory() as td:
+        rec = _standard_case(Path(td))
+        recording = load_recording(rec.cfg)
+        text = recording.summary()
+        assert "COMTRADE 版本" in text
+        assert "Ia" in text
+
+
+# ---------------------------------------------------------------------------
+# 异常数据的健壮性（NF-12）
+# ---------------------------------------------------------------------------
+
+def test_truncated_dat_does_not_crash():
+    """数据文件被截断 —— 必须给出可用结果 + 明确诊断，而不是抛异常。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = _standard_case(tmp, "trunc")
+        data = rec.dat.read_bytes()
+        rec.dat.write_bytes(data[: len(data) // 2])
+        recording, diags = try_load_recording(rec.cfg)
+        assert recording is not None
+        assert any(d.code == Code.DAT_SIZE_MISMATCH for d in diags)
+
+
+def test_single_side_file_does_not_crash():
+    """只有 cfg 没有 dat。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = TempRecording(tmp, "half")
+        rec.write_cfg(CfgSpec(version=1999))
+        recording, diags = try_load_recording(rec.cfg)
+        assert recording is None
+        assert any(d.code == Code.PAIR_MISSING for d in diags)
+
+
+def test_load_recording_raises_with_diagnostics():
+    """单文件导入场景：抛异常，但异常里带着完整诊断供界面展示。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = TempRecording(tmp, "half2")
+        rec.write_cfg(CfgSpec(version=1999))
+        try:
+            load_recording(rec.cfg)
+        except ComtradeParseError as exc:
+            assert exc.diagnostics
+            assert str(exc)
+        else:
+            raise AssertionError("应当抛 ComtradeParseError")
+
+
+def test_garbage_dat_content_does_not_crash():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rec = _standard_case(tmp, "garbage")
+        rec.dat.write_bytes(b"\x00" * 1000)
+        recording, diags = try_load_recording(rec.cfg)
+        # 能读出数据（内容无意义），但必须留下诊断痕迹
+        assert recording is not None
+        assert any(d.code == Code.DAT_SIZE_MISMATCH for d in diags)

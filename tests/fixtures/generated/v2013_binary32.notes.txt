@@ -1,0 +1,4 @@
+v2013_binary32
+2013 版 int32 编码：含 time_code/local_code 与 tmq_code/leapsec 行
+版本=2013 编码=BINARY32 采样率=[(4000.0, 1600)] 采样点=1600
+故障类型=单相接地(A相) 故障时刻=0.1s (第 400 个采样点)
