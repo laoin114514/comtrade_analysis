@@ -459,11 +459,26 @@ class Recording:
             )
         return hit
 
+    def all_by_role(self, role: ChannelRole) -> list[AnalogChannel]:
+        """取占用该角色的**全部**通道。
+
+        一份录波里可能有多个通道同角色（例如同时存在有效值电流 IARMS 与
+        瞬时电流 IA、或多组绕组的三相电流）。解析时会记录 CHN-005 提示歧义，
+        算法模块若发现该提示，应当用本方法列出候选再人工/规则确认。
+        """
+        return [ch for ch in self.analog_channels if ch.role is role]
+
     def by_role_map(self) -> dict[ChannelRole, AnalogChannel]:
         """角色 → 通道的映射，只包含识别成功的通道。
 
         算法模块（E）应当基于这个映射判断"三相电流是否齐全"，
         而不是挨个 try/except。
+
+        取值规则
+            同一角色有多个通道时，取**文件中出现顺序最靠前**的那个
+            （即索引最小者）。这是确定性的，但**不保证是期望的那一组** ——
+            当诊断中出现 CHN-005 时，说明存在歧义，应当改用
+            :meth:`all_by_role` 列出候选后确认。
         """
         out: dict[ChannelRole, AnalogChannel] = {}
         for ch in self.analog_channels:
@@ -529,8 +544,12 @@ class Recording:
             f"通道        : 模拟 {m.analog_count} / 开关量 {m.digital_count}",
             "采样率      : "
             + (
-                ", ".join(f"{seg.rate_hz:g}Hz→{seg.end_sample}点" for seg in m.sample_rate_segments)
-                or "未声明"
+                ", ".join(
+                    (f"{seg.rate_hz:g}Hz→{seg.end_sample}点" if seg.rate_hz > 0
+                     else f"未声明(仅给出结束采样号 {seg.end_sample})")
+                    for seg in m.sample_rate_segments
+                )
+                or "未声明（时间轴按采样时标推算）"
             ),
             f"采样点数    : {m.sample_count}   时长: {self.duration:.6f} s",
             f"起始时刻    : {m.start_time}" if m.start_time else "起始时刻    : -",

@@ -334,6 +334,43 @@ def identify_all(channels, diagnostics, location: str = "") -> None:
         )
 
     _warn_duplicate_names(channels, diagnostics, location)
+    _warn_duplicate_roles(channels, diagnostics, location)
+
+
+def _warn_duplicate_roles(channels, diagnostics, location: str) -> None:
+    """检测"多个通道占用同一角色"。
+
+    真实文件里很常见：一份 SEL 装置的趋势记录里同时有 ``IARMS``（有效值）、
+    ``SDIA``、``SDIAREF``、``dA`` 四组 A/B/C 电流，它们的 ``ph`` 与 ``uu``
+    字段完全一样，角色识别只能都标成 IA/IB/IC。
+
+    这不是识别错误，而是文件本身有多组同相别通道。但下游按角色取通道时
+    只能拿到其中一个（见 :meth:`Recording.by_role_map` 的取值规则），
+    因此必须显式告警，提示人工确认该用哪一组。
+    """
+    from .diagnostics import Code
+    from .models import ChannelRole
+
+    by_role: dict[ChannelRole, list[str]] = {}
+    for ch in channels:
+        if ch.role in (ChannelRole.UNKNOWN, ChannelRole.OTHER):
+            continue
+        by_role.setdefault(ch.role, []).append(ch.name)
+
+    duplicated = {role: names for role, names in by_role.items() if len(names) > 1}
+    if not duplicated:
+        return
+
+    preview = "；".join(
+        f"{role.value} 有 {len(names)} 个（{'/'.join(names[:4])}{'…' if len(names) > 4 else ''}）"
+        for role, names in list(duplicated.items())[:4]
+    )
+    diagnostics.warn(
+        Code.CHN_ROLE_DUPLICATE,
+        f"有 {len(duplicated)} 个角色被多个通道占用，按角色取通道时会取文件顺序中的第一个，"
+        f"结果可能不是期望的那组量，请人工确认：{preview}",
+        location=location,
+    )
 
 
 def _warn_duplicate_names(channels, diagnostics, location: str) -> None:
