@@ -460,3 +460,52 @@ def test_blank_sample_number_does_not_fake_truncation_alarm():
     assert Code.DAT_SIZE_MISMATCH not in codes, "不得再把根因报成'记录数与声明不符'"
     assert Code.DAT_RECORD_SHORT not in codes, "不得再误报'数据可能被截断'"
     assert recording.is_reliable is True, "一份完好的文件不该被判为不可信"
+
+
+# ---------------------------------------------------------------------------
+# 导入文件信息（F-06）
+# ---------------------------------------------------------------------------
+
+def test_import_file_info_is_reported():
+    """F-06「显示导入文件信息」需要文件名/路径/大小都有数据来源。
+
+    回归：解析层原先只输出摘要（sha256）而不输出文件大小，界面只能自己
+    ``stat()`` —— 解析与展示之间文件若被移动、改名或替换，界面 stat 到的
+    就不是本次解析所用的那个文件了。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        rec = _standard_case(Path(td))
+        recording = load_recording(rec.cfg)
+
+        assert recording.meta.source_cfg == rec.cfg
+        assert recording.meta.source_dat == rec.dat
+        assert recording.meta.cfg_size_bytes == rec.cfg.stat().st_size
+        assert recording.meta.dat_size_bytes == rec.dat.stat().st_size
+        assert recording.meta.cfg_size_bytes > 0
+        assert recording.meta.dat_size_bytes > 0
+
+        # 命令行摘要也应能展示（现场排查时直接看得到文件是哪一个、多大）
+        assert "来源文件" in recording.summary()
+
+
+def test_cli_json_exposes_import_file_info():
+    """``--json`` 是对外集成接口，文件信息必须一并给出，界面不必再 stat。"""
+    import io
+    import json
+    from contextlib import redirect_stdout
+
+    from comtrade.__main__ import main
+
+    with tempfile.TemporaryDirectory() as td:
+        rec = _standard_case(Path(td))
+        cfg_size = rec.cfg.stat().st_size
+        dat_size = rec.dat.stat().st_size
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main([str(rec.cfg), "--json"])
+        payload = json.loads(buf.getvalue())
+
+    assert code == 0
+    assert payload["meta"]["cfg_size_bytes"] == cfg_size
+    assert payload["meta"]["dat_size_bytes"] == dat_size

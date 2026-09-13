@@ -43,6 +43,16 @@ _UNRELIABLE_CODES = frozenset(
 )
 
 
+def _human_size(n: int) -> str:
+    """把字节数格式化成人读形式，供命令行摘要使用。"""
+    size = float(n)
+    for unit in ("B", "KB", "MB"):
+        if size < 1024.0:
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} GB"
+
+
 class ComtradeVersion(enum.IntEnum):
     """COMTRADE 版本（对应 IEEE C37.111 各修订年份）。"""
 
@@ -356,6 +366,17 @@ class Metadata:
     dat_sha256: str = ""
     """dat 内容摘要。"""
 
+    cfg_size_bytes: int = 0
+    """来源 .cfg 文件的字节数（F-06「显示导入文件信息」的数据来源）。
+
+    由解析层在读取时固化，而不是让界面自己去 ``stat()`` ——
+    解析与展示之间文件可能被移动、改名或替换，界面事后 stat 到的
+    未必是本次解析所用的那个文件。0 表示未提供（例如手工构造的 Metadata）。
+    """
+
+    dat_size_bytes: int = 0
+    """来源 .dat 文件的字节数。含义同 :attr:`cfg_size_bytes`。"""
+
     # -------------------------------------------------------------- 采样参数
     line_frequency: float = 0.0
     """系统频率（Hz），50 或 60；0 表示文件未声明。"""
@@ -566,7 +587,14 @@ class Recording:
     def summary(self) -> str:
         """生成一段可读摘要，便于日志输出与命令行排查。"""
         m = self.meta
+        cfg_label = m.source_cfg.name if m.source_cfg else "-"
+        if m.cfg_size_bytes:
+            cfg_label += f"（{_human_size(m.cfg_size_bytes)}）"
+        dat_label = m.source_dat.name if m.source_dat else "-"
+        if m.dat_size_bytes:
+            dat_label += f"（{_human_size(m.dat_size_bytes)}）"
         lines = [
+            f"来源文件    : {cfg_label} / {dat_label}",
             f"厂站        : {m.station_name or '-'}   装置: {m.device_id or '-'}",
             f"COMTRADE 版本: {m.version.label}"
             + (f"（声明年份 {m.revision_year}）" if m.revision_year else ""),

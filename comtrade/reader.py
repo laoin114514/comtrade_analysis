@@ -287,6 +287,10 @@ def _load_pair(
     meta.sample_count = parsed_dat.record_count
     meta.cfg_sha256 = compute_file_sha256(cfg_path)
     meta.dat_sha256 = compute_file_sha256(dat_path)
+    # 文件大小随摘要一并固化：界面（F-06）展示的必须是本次解析所用的那两个文件，
+    # 事后再 stat 可能已经指向被移动/替换过的文件。
+    meta.cfg_size_bytes = cfg_path.stat().st_size
+    meta.dat_size_bytes = dat_path.stat().st_size
     meta.header_text = _load_companion_text(cfg_path, ".hdr", diagnostics)
     meta.info_text = _load_companion_text(cfg_path, ".inf", diagnostics)
 

@@ -85,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
                 "digital_count": meta.digital_count,
                 "cfg_sha256": meta.cfg_sha256,
                 "dat_sha256": meta.dat_sha256,
+                "cfg_size_bytes": meta.cfg_size_bytes,
+                "dat_size_bytes": meta.dat_size_bytes,
             }
             payload["analog_channels"] = [
                 {

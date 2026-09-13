@@ -21,6 +21,7 @@
 | 提供异常文件检测及错误提示机制 | `comtrade/diagnostics.py` |
 | 录波数据由原始文件到系统内部分析数据的自动转换 | `comtrade/convert.py` |
 | cfg/dat 自动匹配、完整性检查、非法格式检测 | `comtrade/reader.py`（F-01/F-03/F-04/F-05） |
+| 导入文件信息（文件名 / 路径 / 大小） | `comtrade/models.py` 的 `Metadata`（数据来源，供 F-06 展示） |
 
 覆盖 COMTRADE **1991 / 1999 / 2013** 三个版本，**ASCII / BINARY / BINARY32 / FLOAT32** 四种编码。
 
@@ -150,6 +151,7 @@ Recording（录波对象）
 ├── meta: Metadata
 │   ├── station_name / device_id / revision_year / version
 │   ├── source_cfg / source_dat / cfg_sha256 / dat_sha256
+│   ├── cfg_size_bytes / dat_size_bytes        （F-06 展示用，解析时固化）
 │   ├── line_frequency
 │   ├── sample_rate_segments: [SampleRateSegment(rate_hz, end_sample)]
 │   ├── start_time / trigger_time
